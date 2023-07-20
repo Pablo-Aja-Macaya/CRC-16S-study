@@ -1,6 +1,5 @@
 *.html
 output/
-data/
 data/feature-table.json
 data/separated_taxonomy.tsv
 data/taxonomy.tsv
