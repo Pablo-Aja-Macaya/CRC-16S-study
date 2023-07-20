@@ -1,0 +1,1795 @@
+---
+title: "16S Microbiome analysis of full cohort in PRJNA911189"
+output:
+  html_document:
+    highlight: 'haddock'
+    theme: paper
+    df_print: paged
+    number_sections: true
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+    cache       = TRUE,     # if TRUE knitr will cache the results to reuse in future knits
+    fig.width   = 10,       # the width for plots created by code chunk
+    fig.height  = 6,       # the height for plots created by code chunk
+    fig.align   = 'center', # how to align graphics in the final doc. 
+    warning     = FALSE,
+    message     = FALSE,
+    comment     = NA
+)
+# knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+# getwd()
+```
+
+```{css, echo=FALSE, include = FALSE}
+.header-section-number::after {
+  content: ".";
+}
+```
+
+# Introduction
+
+In this document 16S microbiome data from samples of multiple origins (saliva, subgingival-fluid, faeces, adenocarcinoma and normal-mucosa)
+and two patient types (CRC or non-CRC) is analyzed. The original reads can be found in bioproject PRJNA911189. The objective is to detect differences in the microbiome of these two kinds of patients. The main analyses are composed of: alpha-diversity, beta-diversity, relative abundance, PERMANOVA tests and differential abundance.
+
+The important columns from the metadata used are origin (faeces, saliva, adenocarcinoma...), sample.type (CRC/non-CRC), localization (location of the cancer in the intestines, like rectum, transverse-colon...), TNM classifications, sex and age.
+
+# Libraries
+
+Load the neccessary libraries and set options such as a reproducible seed:
+```{r message=FALSE, warning=FALSE,  class.source = 'fold-show'}
+# Libraries
+library(ggplot2)
+library(patchwork)
+library(plotly)
+library(vegan)
+library(devtools)
+library(data.table)
+library(VennDiagram)
+library(RColorBrewer)
+library(egg)
+library(randomcoloR)
+library(ggvenn)
+library(glue)
+library(tidyr)
+library(purrr)
+library(plyr)
+library(dplyr)
+library(phyloseq)
+library(ggalluvial)
+library(stringr)
+library(gtools)
+
+# Note: ANCOM-BC is loaded in its own section, this is because it loads tidytree and 
+# creates an unavoidable warning/message each time a function in the the phyloseq package is used,
+# which when outputting to the report makes it difficult to read
+
+# Options
+options(dplyr.summarise.inform = FALSE)
+options(getClass.msg=FALSE)
+
+# Set seed
+set.seed(123)
+```
+
+Load a function to show pretty tables in HTML format:
+
+```{r class.source = 'fold-show'}
+create.table <- function(df, capt=NULL){
+  DT::datatable(df, extensions = c('FixedColumns'),
+                options = list(scrollX = TRUE, pageLength = 5), 
+                caption=htmltools::tags$caption(
+                  style = 'caption-side: bottom; text-align: center; color: black;',
+                  htmltools::em(capt)
+                ))
+}
+
+load_rdata <- function(fileName){
+  # Loads an RData file, and returns it
+  load(fileName)
+  get(ls()[ls() != "fileName"])
+}
+```
+
+# Load data
+There are three parts that must be loaded for a phyloseq object, the features (ASV), metadata and taxonomy information. The following sections will prepare the input and load them. The neccessary input for the script is specified here:
+
+```{r class.source = 'fold-show'}
+# Input
+BASE_DIR = "/home/usuario/Proyectos/CRC-16S-study"
+feature_table_file <- as.character(glue("{BASE_DIR}/data/feature-table.json"))
+contamination_file <- as.character(glue("{BASE_DIR}/data/contaminants.tsv"))
+metadata_file <- as.character(glue("{BASE_DIR}/data/non-ffpe_metadata.tsv"))
+taxmat_file <- as.character(glue("{BASE_DIR}/data/separated_taxonomy.tsv"))
+tree_file <- as.character(glue("{BASE_DIR}/data/tree.nwk"))
+output_folder <- as.character(glue("{BASE_DIR}/output"))
+biosample_col <- "biosample_name"
+variables_of_interest <- c("origin", "sample.type")
+```
+
+## Features
+Load features and remove those which are empty (samples with bad quality or controls):
+```{r}
+# Transform biome data to JSON.biome
+# biom convert -i in.biom -o out.biom.json --table-type="OTU table" --to-json
+
+# Read
+otu_df <- import_biom(feature_table_file)
+
+# Remove columns/samples with all 0s (no data)
+condition <- colSums(otu_df) != 0
+otu_df_empty_cols <- colnames(otu_df)[!condition]
+if (length(otu_df_empty_cols)>0){
+  print(glue("WARNING: There are {length(otu_df_empty_cols)} empty columns in ASV dataframe (no data, this can happen in controls) and they will be removed: '{paste(otu_df_empty_cols, collapse='; ')}'"))
+}
+otu_df <- otu_df[, condition]
+
+create.table(head(otu_df), "Head of feature table.")
+```
+
+## Metadata
+
+Metadata is read and initially processed here:
+
+```{r}
+# Read metadata
+metadata <- read.delim(metadata_file, comment.char = "#")
+
+# Check if there are columns not in otu_df besides the otu_df columns that were empty
+condition <- metadata[,'sample.id'] %in% colnames(otu_df)
+sample.ids.not.in.otus <- metadata[!condition,]$sample.id
+if (length(setdiff(otu_df_empty_cols, sample.ids.not.in.otus))>0){
+  print("There are samples in metadata that do not exist in ASV dataframe. This can happen if they were removed in the previous step.")
+  print(setdiff(otu_df_empty_cols, sample.ids.not.in.otus))
+}
+metadata <- metadata[condition,] # eliminar muestras si no existen en otu_df
+rownames(metadata) <- metadata[,'sample.id']
+
+# Create column for grouping by variables_of_interest
+if ("grouping_var" %in% names(metadata)){
+  stop("Ups, metadata already has grouping_var as column")
+} else {
+  metadata$grouping_var <- do.call(paste, c(metadata[variables_of_interest], sep="__"))
+}
+
+# Make categorical columns
+for (i in variables_of_interest){
+  metadata[[i]] <- factor(metadata[[i]])
+}
+
+create.table(metadata, "Metadata table.")
+```
+
+## Taxonomy
+
+The taxonomy is read and processed here, propagating the levels, filling NAs in taxa levels with the last known level:
+
+```{r}
+# Taxonomy must be split into columns
+taxmat = as.matrix(read.delim(taxmat_file, sep='\t'))
+
+# Propagate NAs
+keep_unidentified <- function(tx_table){
+  # Keep the ones that have one of c(NA, "", " ", "\t") in target_level column
+  # and then find the last level that is known (can be Genus, Family...)
+  # Assign to the target_level level the last known level + x__XXX NA
+  # Family (last known)   Species
+  # f__Lachnospiraceae    f__Lachnospiraceae NA
+  elements_to_target <- colnames(tx_table)
+  tx_table <- as.data.frame(tx_table)
+  previous_level <- elements_to_target[1]
+  for (level in elements_to_target[2:length(elements_to_target)]){
+    empty_values <- tx_table[[level]] %in% c(NA, "", " ", "\t")
+    tx_table[[level]][empty_values] <- paste(tx_table[[previous_level]][empty_values], "NA", sep="_")
+    tx_table[[level]][empty_values] <- gsub("(_NA[> ]*)*", "\\1", tx_table[[level]][empty_values]) # Replace repetitions of NA by one NA
+
+    previous_level <- level
+  }
+
+  return(tx_table)
+}
+taxmat <- as.matrix(keep_unidentified(taxmat))
+
+# Set row names
+rownames(taxmat) <- rownames(otu_df)
+
+create.table(head(taxmat), "Head of taxonomy table.")
+```
+
+
+# Apply controls
+
+Substract ASVs found in control samples in a per-sequencing run basis (specified in metadata), in order to reduce possible PCR and kit contaminations. This substraction will not directly remove an ASV in all samples, but substract the sum of its raw count across control samples.
+
+```{r}
+substract_control <- function(features, metadata, importance_multiplier=1){
+  # Substract ASVs that appear in controls per sequencing-run
+  # - features: ASV table
+  # - metadata: dataframe with metadata
+  # - importance_multiplier: increase this to a big number to fully remove ASVs that appear in controls (like 999999)
+  # cat("\nUsing controls for cleaning...\n")
+  
+  # Function to calculate the sum of each ASV
+  sum_rows <- function(input){
+    # if input is a dataframe do rowSums to get a vector
+    # if it is already a vector return it
+    if (is.null(ncol(input))){
+      return (input)
+    } else {
+      return (rowSums(input))
+    }
+  }
+  
+  # Initialize clean dataframe with non-control ids
+  clean.otu.df <- features[, subset(metadata, origin!="control")$sample.id]
+  # clean.otu.df <- features
+  
+  # Split "control.applies.to.origin" column by ";"
+  # The resulting elements will be searched in "origin" column 
+  # and the control will be applied to corresponding samples
+  metadata$control.applies.to_split <- strsplit(metadata$control.applies.to.origin, ";")
+  
+  # For each control ID
+  for (control_id in subset(metadata, origin=="control")$sample.id ){
+    # Get the metadata of the control ID
+    r <- subset(metadata, sample.id==control_id)
+    
+    # Log
+    control_id_seq_run = r$sequencing.run
+    # print(glue("\n==== Using sample.id '{control_id}' as control in sequencing.run='{control_id_seq_run}' ===="))
+    
+    # Check that if element "all" is present no other elements exist
+    # and that an element is not repeated with unique
+    applies_to_elements <- unique(r$control.applies.to_split[[1]]) # To access split elements: metadata$control.applies.to_split[65][[1]][1]
+    if ("all" %in% applies_to_elements & length(applies_to_elements)>1){
+      stop("Element 'all' was specified, but extra elements are present. Please choose either 'all' or the other elements")
+    }
+    
+    # For each origin to which the control applies to
+    for (applies_to in applies_to_elements){ 
+      # print(glue("\n~~~ Applying control to: '{applies_to}' ~~~"))
+      
+      tmp <- subset(metadata, origin!="control" & sequencing.run==control_id_seq_run)
+      
+      # If the control applies to all samples
+      if (applies_to == "all"){
+        tmp <- tmp
+        # If it only applies to a certain origin type which IS in metadata$origin
+      } else if (applies_to %in% metadata$origin){
+        tmp <- subset(tmp, origin==applies_to)
+        # If it is not "all" or the element doesnt exist in metadata$origin, raise error 
+      # If it is not "all" or the element doesnt exist in metadata$origin, raise error 
+        # If it is not "all" or the element doesnt exist in metadata$origin, raise error 
+      } else {
+        warning(glue("Origin '{applies_to}' is not in metadata$origin column, please fix"))
+      }
+      
+      if (length(tmp$sample.id) >= 1){
+        # print(glue("Applying control.id={control_id} from sequencing.run={control_id_seq_run} to element={applies_to} in {length(tmp$sample.id)} samples"), "\n")
+        clean.otu.df[,tmp$sample.id] <- clean.otu.df[,tmp$sample.id] - sum_rows(features[,c(control_id)])*importance_multiplier      
+      } else {
+        stop(glue("WARNING: Control control.id={control_id} from sequencing.run={control_id_seq_run} cant be applied to element={applies_to}, no samples match ({length(tmp$sample.id)} samples)\nThis in unexpected, every control should apply to at least one sample! Check metadata?"))
+      }
+    }
+  }
+
+  # Negative numbers to 0
+  clean.otu.df[clean.otu.df<0] <- 0
+  
+  return(clean.otu.df)
+}
+
+clean.otu.df <- substract_control(otu_df, metadata)
+```
+
+# Create phyloseq object
+The phyloseq object can finally be created merging the feature, taxonomy and metadata tables:
+
+```{r message=FALSE, warning=FALSE}
+OTU = otu_table(clean.otu.df, taxa_are_rows = TRUE)
+TAX = tax_table(taxmat)
+SAM = sample_data(metadata)
+TREE = read_tree(tree_file)
+
+physeq = phyloseq(OTU, TAX, SAM, TREE)
+physeq
+```
+
+## Remove typical contamination by name
+
+Additionally, we remove possible contaminant ASVs using their genus and known contaminants from the input "contamination_file", with some additional manual names specified in the code:
+
+```{r}
+pop_taxa = function(ps, bad_asvs){
+  all_asvs = taxa_names(ps)
+  keep_these <- all_asvs[!(all_asvs %in% bad_asvs)]
+  return(prune_taxa(keep_these, ps))
+}
+# Only bacteria
+bad_asvs <- taxa_names(subset_taxa(tax_table(physeq), Domain!="d__Bacteria"))
+physeq <- pop_taxa(physeq, bad_asvs)
+
+# Remove typical contamination
+typical_contamination <- read.csv(contamination_file, sep='\t')
+typical_contamination$Genus <- paste("g__", typical_contamination$Genus, sep="")
+
+cont_genus <- c(typical_contamination$Genus, paste(typical_contamination$Genus, "NA", sep= "_"))
+physeq <- subset_taxa(physeq, !Genus %in% cont_genus)
+
+# Manual names
+bad_asvs <- taxa_names(
+  subset_taxa(
+    tax_table(physeq), 
+    Family %in% c("f__Dermacoccaceae",
+                  "f__Mitochondria",
+                  "f__Chloroplast"
+                  ) |
+    Genus %in% c(
+      "g__Burkholderia-Caballeronia-Paraburkholderia",
+      "g__Methylobacterium-Methylorubrum",
+      "g__Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium",
+      "g__Acinetobacter"
+    )
+  )
+)
+physeq <- pop_taxa(physeq, bad_asvs)
+
+# Keep ASVs with more than one count
+physeq <- prune_taxa(taxa_sums(physeq) > 1, physeq) 
+
+# Remove 1 sample that is possibly wrong (studied through manual beta-diversity analysis, not shown)
+physeq <- subset_samples(physeq, 
+                         !sample.id %in% c(
+                           "CCR-142-1-s" # In theory it is saliva, but looks like faeces
+                         )
+)
+physeq
+```
+
+# Extra metadata processing
+
+Some additional processing of the metadata is done in this section, such as simplifying categories (e.g. tumor locations or CRC stages) and specifying which columns are factors.
+
+## Simplifying metadata columns
+
+Here we simplify some columns from the metadata like age and TNM categories into broader groups to balance the samples in each category. Additionally, factors are set up and ordered:
+
+* TNM-T is simplified into having a big tumor (T3, T4) or not (T1,T2).
+* TNM-N is simplified into having affected lymph nodes (>=N1) or not (N0).
+* TNM-M is simplified into having metastasis (M1, M2) or not (M0).
+* Age is simplified into "under 60", "betweeen 60 and 69" and "over 70".
+* Tumor locations are simplified into four categories: right colon (right-colon, hepatic-flexure, cecum), transverse colon, left colon (left-colon, sigmoid-colon, splenic-flexure) and rectum.
+
+```{r}
+# ---- Column simplification ----
+# Get metadata from the phyloseq object into a temporary dataframe
+temp <- data.frame(sample_data(physeq))
+
+# Simplify tnm
+temp$has_affected_lymph_nodes <- as.integer(temp$tnm_n != "N0")
+temp$has_big_tumor <- as.integer(temp$tnm_t %in% c("T3","T4"))
+temp$has_metastasis <- as.integer(temp$tnm_m %in% c("M1","M2"))
+
+# Simplify age
+temp <- temp %>% mutate(age_group = case_when(
+  age < 60 ~ 'under60',
+  age >= 60  & age < 70 ~ '60to69',
+  age >= 70 ~ 'over70',
+)
+) 
+
+# Simplify tumor location
+temp$simplified_location <- temp$localization
+temp$simplified_location[temp$simplified_location %in% c("right-colon", "hepatic-flexure", "cecum")] <- "RIGHT"
+temp$simplified_location[temp$simplified_location %in% c("left-colon", "sigmoid-colon", "splenic-flexure")] <- "LEFT"
+
+# Return new columns to phyloseq object
+sample_data(physeq)$has_affected_lymph_nodes <- temp$has_affected_lymph_nodes
+sample_data(physeq)$has_big_tumor <- temp$has_big_tumor
+sample_data(physeq)$has_metastasis <- temp$has_metastasis
+sample_data(physeq)$simplified_location <- temp$simplified_location
+sample_data(physeq)$age_group <- temp$age_group
+
+# ---- Set up factors ----
+sample_data(physeq)$sample.type <- factor(sample_data(physeq)$sample.type,      # Reordering group factor levels
+                                          levels = c("non-crc", "crc")
+)
+sample_data(physeq)$origin <- factor(sample_data(physeq)$origin,      # Reordering group factor levels
+                                     levels = c("adenocarcinoma","faeces","normal-mucosa","saliva","subgingival-fluid")
+)
+
+more_factor_cols = c("simplified_location","localization","subject","age_group","sex",
+                     "tnm_t","tnm_n","tnm_m",
+                     "has_big_tumor","has_metastasis","has_affected_lymph_nodes"
+                     )
+sample_data(physeq)[,more_factor_cols] <- lapply(sample_data(physeq)[,more_factor_cols], factor)
+
+# Here we set up factors and their order:
+sample_data(physeq)$sample.type <- factor(sample_data(physeq)$sample.type,      # Reordering group factor levels
+                                          levels = c("non-crc", "crc")
+)
+sample_data(physeq)$origin <- factor(sample_data(physeq)$origin,      # Reordering group factor levels
+                                     levels = c("adenocarcinoma","faeces","normal-mucosa","saliva","subgingival-fluid")
+)
+
+more_factor_cols = c("simplified_location","localization","subject","age_group","sex",
+                     "tnm_t","tnm_n","tnm_m",
+                     "has_big_tumor","has_metastasis","has_affected_lymph_nodes"
+                     )
+sample_data(physeq)[,more_factor_cols] <- lapply(sample_data(physeq)[,more_factor_cols], factor)
+
+```
+
+## Some metadata stats
+
+In the following plot the subject density based on sex and age can be seen per sample.type (CRC or non-CRC):
+
+```{r}
+# Get metadata for each patient
+subject_metadata <- data.frame(sample_data(physeq)[,c("subject","age","sex","localization","simplified_location","age_group","sample.type")])
+rownames(subject_metadata) <- NULL
+subject_metadata <- subject_metadata %>% dplyr::distinct()
+
+# Age density
+temp <- list(
+  female_crc=length(subset(subject_metadata, sample.type=='crc' & sex=="female")$sex),
+  male_crc=length(subset(subject_metadata, sample.type=='crc' & sex=="male")$sex),
+  female_noncrc=length(subset(subject_metadata, sample.type=='non-crc' & sex=="female")$sex),
+  male_noncrc=length(subset(subject_metadata, sample.type=='non-crc' & sex=="male")$sex)
+)
+p <- ggplot(subject_metadata, aes(x = age)) +
+  geom_density(aes(color = sex, fill = sex), 
+               position = "identity", alpha = 0.3) +
+  facet_wrap(~sample.type) + 
+  scale_color_manual(values = c("#00AFBB", "#E7B800")) +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800")) +
+  ggtitle(glue("Age distribution - (CRC: M={temp$male_crc}, F={temp$female_crc} | non-CRC: M={temp$male_noncrc}, F={temp$female_noncrc})")) +
+  theme_bw()
+p
+
+
+
+```
+
+
+# Calculate rarefied phyloseq object
+
+A rarefied phyloseq object is calculated here and will be used in some posterior analysis sucha as beta-diversity and descriptive relative abundance barplots:
+
+```{r}
+rar_physeq <- rarefy_even_depth(physeq, sample.size = 10000,
+                                  replace = FALSE, trimOTUs = TRUE, verbose = TRUE)
+rar_physeq
+```
+
+
+# Alpha-diversity
+
+Using the original phyloseq object, without rarefying, we obtain alpha-diversity measures. First, the main function is described:
+```{r}
+plot_alpha_diversity <- function(physeq_obj, measures, x, color_col){
+  # ---- Plot alpha diversity ----
+  alpha_div_plot <- plot_richness(physeq_obj, x=x, color=color_col, measures=measures) + 
+    geom_boxplot() + theme_bw() +
+    # facet_grid(variable~origin, scale="free") +
+    # scale_x_discrete(limits = c("saliva__non-crc", "saliva__crc", "subgingival-fluid__crc", "faeces__non-crc", "faeces__crc", "normal-mucosa__crc", "adenocarcinoma__crc")) +
+    theme(plot.title = element_text(hjust = 0.5),
+          panel.grid.minor.y = element_blank(),
+          axis.title = element_text(size = 12),
+          axis.text.x = element_text(angle = 90, hjust=0.95, vjust=0.2),
+          axis.text = element_text(size = 12))
+
+  # ---- Wilcoxon-test ----
+  richness <- estimate_richness(physeq_obj, measures=measures)
+  rownames(richness) <- gsub("\\.", '-', rownames(richness))
+  richness <- merge(richness, data.frame(sample_data(physeq_obj)), by=0)
+  richness$group <- as.factor(richness$group)
+  
+  # Run test for each combination of groups
+  wilcox_list <- list()
+  n = 1
+  for (m in measures){
+    for (i in sort(unique(richness$group))){
+      for (j in sort(unique(richness$group))){
+        res <- NULL
+        # As long as the group is not the same (error if it is)
+        if (i!=j){
+          # Run the test between groups and print if significative
+          res <- wilcox.test(as.formula(glue("{m} ~ group")), 
+                      data=subset(richness, 
+                                  group %in% c(i, j)
+                      )
+          )
+          wilcox_list[[n]] <- c(i, j, m, res$p.value)
+        } else {
+          wilcox_list[[n]] <- c(i, j, m, NA)
+        }
+        n=n+1
+      }
+    }  
+  }
+  
+  # Format Wilcox results
+  wilcox_df <- as.data.frame(do.call(rbind, wilcox_list))
+  names(wilcox_df) <- c("C1","C2","measure","pval")
+  wilcox_df$pval <- as.numeric(wilcox_df$pval)
+  
+  # Plot each wilcoxon test
+  significance_p_list <- list()
+  for (m in measures){
+    df <- subset(wilcox_df, measure==m)[c("C1","C2","pval")]
+  
+    # Turn to wide and block lower triangle
+    df <- as.data.frame(df %>% tidyr::pivot_wider(names_from = C1, values_from = pval))
+    df[-1][lower.tri(df[-1])] <- NA
+    
+    # Turn to long
+    df <- df %>% pivot_longer(!C2, names_to = "C1", values_to = "pval")
+    
+    p <- ggplot(df, aes(C1, C2, fill=pval)) + 
+      geom_tile() +
+      scale_fill_gradient(low="darkgreen", high="white", na.value = "white", limits=c(0,0.1)) +
+      # scale_y_discrete(position = "right") +
+      theme_bw() + 
+      ylab("") + ggtitle(glue("{m}")) + xlab("") + 
+      theme(axis.text.x=element_text(angle = 60, hjust=0.95, vjust=0.95), legend.key.size = unit(0.5,"line"))
+    significance_p_list[[m]] <- p
+  }
+  
+  return(list(alpha_div_plot=alpha_div_plot, significance_p_list=significance_p_list))
+  
+}
+```
+
+Calculate using all types of samples:
+```{r}
+measures <- c("Chao1","Shannon","Simpson")
+ps <- subset_samples(physeq)
+sample_data(ps)$group <- paste(
+  sample_data(ps)$origin,
+  sample_data(ps)$sample.type,
+  sep='__'
+)
+res = plot_alpha_diversity(ps, measures, "group", "origin")
+res$alpha_div_plot
+res$significance_p_list$Chao1 + res$significance_p_list$Shannon + res$significance_p_list$Simpson + plot_layout(guides = "collect", ncol=3)
+```
+
+Calculate using adenocarcinoma samples with locations:
+```{r}
+ps <- subset_samples(physeq, origin=="adenocarcinoma")
+res = plot_alpha_diversity(ps, measures, "simplified_location", "simplified_location")
+res$alpha_div_plot
+```
+
+# Beta-diversity
+
+Beta-diversity ordination is calculated using the rarefied phyloseq object and the combination of origin+sample.type, using ordination methods such as MDS or NDMS and distances such as jaccard, braay, jsd and wunifrac.
+
+Calculate all combinations and plot:
+```{r echo = T, results = 'hide'}
+# Create beta-diversity plots for every combination of method+distance 
+method_vector <- c("MDS","NMDS") #dPCoA
+distance_vector <- c("jaccard","bray","jsd","wunifrac")
+p_list <- list()
+for (i in asplit(crossing(method_vector, distance_vector), 1)){
+  # Set up
+  m <- i[["method_vector"]]
+  d <- i[["distance_vector"]]
+  dist <- NULL
+  p <- NULL
+  title = glue(glue("Method: {m}, Distance: {d}"))
+  print(title)
+  
+  # Ordination
+  if (d=="jaccard"){ # important for jaccard to add binary=TRUE
+    dist <-ordinate(rar_physeq, m, d, binary = TRUE, formula=~origin+sample.type)
+  } else {
+    dist <-ordinate(rar_physeq, m, d, formula=~origin+sample.type)
+  }
+  
+  # Plot
+  p <- plot_ordination(rar_physeq, dist, 
+                       type="sites", color="grouping_var", shape="sample.type", 
+                       title=title) + 
+    stat_ellipse() + theme_classic()
+  
+  p_list[[m]][[d]] <- p
+}
+p_MDS <- p_list$MDS$bray + p_list$MDS$jaccard + p_list$MDS$jsd + p_list$MDS$wunifrac + plot_layout(guides = "collect")
+p_NDMS <- p_list$NMDS$bray + p_list$NMDS$jaccard + p_list$NMDS$jsd + p_list$NMDS$wunifrac + plot_layout(guides = "collect")
+# ggsave(glue("{output_folder}/betadiversity_MDS.png"), p_MDS, dpi="retina", unit="px", height=3000, width=3000)
+# ggsave(glue("{output_folder}/betadiversity_NMDS.png"), p_NDMS, dpi="retina", unit="px", height=3000, width=3000)
+
+p_MDS
+p_NDMS
+```
+
+
+A good combination was MDS+JSD:
+```{r}
+p_mds_jsd <- p_list$MDS$jsd + scale_color_discrete() + theme_bw() + 
+  theme(
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    axis.text.y=element_text(size=10), 
+    axis.title.y=element_text(size=10),
+    legend.text=element_text(size=8),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    # panel.background = element_blank(),
+    # axis.ticks.x=element_blank()
+    axis.line = element_line(colour = "black")
+  )
+# ggsave(glue("{output_folder}/betadiversity_MDS_JSD.png"), p_mds_jsd, dpi="retina", unit="px", height=3000, width=3500)
+p_mds_jsd
+```
+
+
+Additionally, distance was calculated with DPCoA separatedly (it took one full day to complete), so it is loaded and shown here. This is the distance chosen for the PERMANOVA analyses in the next section:
+```{r}
+dpcoa_full_rarified_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_full_rarified_dist.RData")) # calculated using phyloseq::distance(rar_physeq, "dpcoa")
+iMDS <- ordinate(rar_physeq, "MDS", distance=dpcoa_full_rarified_dist)
+p_mds_dpcoa <- plot_ordination(rar_physeq, iMDS,  color="grouping_var") + 
+  stat_ellipse() + theme_classic() +
+  scale_color_discrete() + theme_bw() + 
+  theme(
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    axis.text.y=element_text(size=10), 
+    axis.title.y=element_text(size=10),
+    legend.text=element_text(size=8),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    # panel.background = element_blank(),
+    # axis.ticks.x=element_blank()
+    axis.line = element_line(colour = "black")
+  )
+# ggsave(glue("{output_folder}/betadiversity_MDS_dpcoa.png"), p_mds_jsd, dpi="retina", unit="px", height=3000, width=3500)
+p_mds_dpcoa
+```
+
+
+# PERMANOVA using adonis2
+
+Here various adonis2 test are executed using different kinds of samples and variables and the rarefied phyloseq object. The objective is to see which variables influence the distance between samples, which is calculated using DPCoA, selected based on the beta-diversity section. The distances were calculated and saved in objects previously due to how long it takes to calculate them, so they are loaded in each subsection.
+
+<!-- dpcoa_full_rarified_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_full_rarified_dist.RData")) -->
+<!-- dpcoa_adenocarcinoma_rarified_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_adenocarcinoma_rarified_dist.RData")) -->
+<!-- dpcoa_adenocarcinomaandnormal_rarified_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_adenocarcinomaandnormal_rarified_dist.RData")) -->
+<!-- dpcoa_faeces_rarified_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_faeces_rarified_dist.RData")) -->
+<!-- dpcoa_ccrfaeces_rarified_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_ccrfaeces_rarified_dist.RData")) -->
+<!-- dpcoa_saliva_rarified_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_saliva_rarified_dist.RData")) -->
+
+**Test for origin in general:**
+```{r}
+# Filter
+rar_ps = subset_samples(rar_physeq)
+
+# Matriz de distancias
+rar_physeq_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_full_rarified_dist.RData"))
+sampledf <- data.frame(sample_data(rar_ps))
+
+# Adonis test
+permanova <- adonis2(
+  rar_physeq_dist ~ origin + sample.type + age + sex, 
+  data = sampledf, permutations = 9999, by="margin",
+  parallel = 60)
+
+print(permanova)
+```
+
+**Test for adenocarcinoma samples:**
+```{r}
+# Filter
+rar_ps = subset_samples(rar_physeq, 
+                        sample.type %in% c("crc") & 
+                        origin %in% c("adenocarcinoma")
+                        )
+
+# Matriz de distancias
+rar_physeq_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_adenocarcinoma_rarified_dist.RData"))
+sampledf <- data.frame(sample_data(rar_ps))
+
+# Adonis test
+permanova <- adonis2(
+  rar_physeq_dist ~ simplified_location + age + sex + has_affected_lymph_nodes + has_big_tumor + has_metastasis, 
+  data = sampledf, permutations = 9999, by="margin",
+  parallel = 60)
+
+print(permanova)
+```
+
+**Test for adenocarcinoma vs normal-mucosa samples:**
+```{r}
+# Filter
+rar_ps = subset_samples(rar_physeq, 
+                        sample.type %in% c("crc") & 
+                        origin %in% c("adenocarcinoma","normal-mucosa")
+                        )
+
+# Matriz de distancias
+rar_physeq_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_adenocarcinomaandnormal_rarified_dist.RData"))
+sampledf <- data.frame(sample_data(rar_ps))
+
+# Adonis test
+permanova <- adonis2(
+  rar_physeq_dist ~ origin + simplified_location + age + sex, 
+  data = sampledf, permutations = 9999, by="margin",
+  parallel = 60)
+
+print(permanova)
+```
+
+**Test for faeces samples:**
+```{r}
+# Filter
+rar_ps = subset_samples(rar_physeq, 
+                        sample.type %in% c("non-crc","crc") & 
+                        origin %in% c("faeces")
+                        )
+
+# Matriz de distancias
+rar_physeq_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_faeces_rarified_dist.RData"))
+sampledf <- data.frame(sample_data(rar_ps))
+
+# Adonis test
+permanova <- adonis2(
+  rar_physeq_dist ~ sample.type + age + sex, 
+  data = sampledf, permutations = 9999, by="margin",
+  parallel = 60)
+
+print(permanova)
+```
+
+**Test for faeces samples, but only in patients with CRC:**
+```{r}
+# Filter
+rar_ps = subset_samples(rar_physeq, 
+                        sample.type %in% c("crc") & 
+                          origin %in% c("faeces")
+)
+
+# Matriz de distancias
+rar_physeq_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_ccrfaeces_rarified_dist.RData"))
+sampledf <- data.frame(sample_data(rar_ps))
+
+# Adonis test
+permanova <- adonis2(
+  rar_physeq_dist ~ age + sex + simplified_location + has_affected_lymph_nodes + has_big_tumor + has_metastasis, 
+  data = sampledf, permutations = 9999, by="margin",
+  parallel = 60)
+
+print(permanova)
+```
+
+**Test for saliva:**
+```{r}
+# Filter
+rar_ps = subset_samples(rar_physeq, 
+                        sample.type %in% c("crc","non-crc") & 
+                          origin %in% c("saliva")
+)
+
+# Matriz de distancias
+rar_physeq_dist <- load_rdata(glue("{output_folder}/heavy_objects/dpcoa_saliva_rarified_dist.RData"))
+sampledf <- data.frame(sample_data(rar_ps))
+
+# Adonis test
+permanova <- adonis2(
+  rar_physeq_dist ~ sample.type + age + sex, 
+  data = sampledf, permutations = 9999,
+  parallel = 60)
+
+print(permanova)
+```
+
+
+
+# Relative abundance
+
+Mean relative abundance per type of sample is calculated in this section. Prevalence and minimum abundance filters are used on the rarefied phyloseq object, grouping by biosample first (a biosample can be sequenced multiple times) and then by variables of interest (origin+sample.type). Abundance filters are used on a per-element basis, meaning very rare species inside an element are removed (element being a sample-id when grouping by biosample and a biosample when grouping by variables of interest). Then, a prevalence filter is applied to each group of elements (e.g. features in group faeces+CRC will need to be in N% of the biosamples that form the group, same goes for the samples that form a biosample).
+
+## Calculating relative abundance`
+
+First, we declare the functions that will do the bulk of the analysis (click code to see them):
+
+```{r}
+check_rel_abund_sum <- function(data, group_cols, rel_abund_col){
+  # Check relative abundances sum to 1
+  sum_check <- data %>% 
+    dplyr::rename("rel_abund_col" = rel_abund_col) %>%
+    dplyr::group_by(across(all_of(c(group_cols)))) %>%
+    dplyr::summarise(sum_relative_abundance = sum(rel_abund_col)) 
+  # Check has to be done with "all.equal" because at these scales using "==" gives unexpected results
+  check <- mapply(function(x) {isTRUE(all.equal(x, 1))}, sum_check$sum_relative_abundance)
+  if (any(!check) == TRUE){
+    print(sum_check)
+    stop("ERROR: The sum of relative abundances for each group should be 1. At least one group fails this rule. This should never happen. Stopping...")
+  }
+  return(TRUE)
+}
+
+get.otus.to.keep.by.prevalence <- function(group, data, abundance_threshold, prevalence_threshold, sample_col="sample.id", abundance_col="Abundance"){
+  starting.otus.count <- length(unique(data$OTU))
+  
+  # print(glue("\nFiltering group composed of: '{paste(group, collapse='; ')}'"))
+  
+  # For each sample, filter to OTUs that have a relative abundance over N% 
+  # and appear in at least M% of the other samples in its group
+  abundance_over_list <- list()
+  abundance_under_list <- list()
+  for (i in group){
+    # For each sample.id in group
+    # Calculate relative abundance for the sample.id's data
+    # Get OTUs over threshold into a list
+    df <- data[ data[[sample_col]] == i , ]
+    df$relative_abundance <- df[[abundance_col]]/sum(df[[abundance_col]])
+    otus_over_thresh <- subset(df, relative_abundance>=abundance_threshold)$OTU
+    otus_under_thresh <- subset(df, relative_abundance<abundance_threshold)$OTU
+    abundance_over_list[[i]] <- otus_over_thresh
+    abundance_under_list[[i]] <- otus_under_thresh
+    # print(glue("Sample {i} keeps {length(otus_over_thresh)}/{length(otus_under_thresh)+length(otus_over_thresh)} ASVs filtering by abundance={abundance_threshold}"))
+  }
+  
+  # Transform list of vectors into a presence/absence dataframe by matching ASV names
+  # leaving NAs if a sample does not have the ASV.
+  # Each row is an ASV, each column is a sample
+  # Example:
+  #                             ccr11-1s                       CCR-59-1-s                       CCR-57-1-s
+  # 1   101637aba474a6614786486ad42acb11 101637aba474a6614786486ad42acb11 101637aba474a6614786486ad42acb11
+  # 2   00a2f7e2564becc62e71c46821779802                             <NA>                             <NA>
+  # 3   f7cf33648c7d6bda19e991b97583cdab f7cf33648c7d6bda19e991b97583cdab f7cf33648c7d6bda19e991b97583cdab
+  # 21  0a49a32752b611a144ddd506a2155134                             <NA> 0a49a32752b611a144ddd506a2155134
+  # 22  5258515ff2816e94d24b2bd02f8ae803                             <NA> 5258515ff2816e94d24b2bd02f8ae803
+  # 23  c773422b3dd3b7f057a6ec0d5fb93733 c773422b3dd3b7f057a6ec0d5fb93733                             <NA>
+  otu_presence <- abundance_over_list %>%
+    map(~ data.frame(col = ., ., stringsAsFactors = FALSE)) %>%
+    reduce(full_join, by = "col") %>%
+    select(-col) %>%
+    setNames(names(abundance_over_list))
+  
+  # Set the OTUs as row names
+  rownames(otu_presence) <- apply(otu_presence, 1, function(z) na.omit(z)[1])
+  
+  # Select which OTUs have to be kept by prevalence
+  # The ASVs that appear in at least X% of the samples (row-wise)
+  condition <- (rowSums(!is.na(otu_presence)) / dim(otu_presence)[2]) >= prevalence_threshold
+  otus_to_keep <- rownames(otu_presence)[condition]
+  otus_to_loose_by_prevalence <- rownames(otu_presence)[!condition]
+  # print(glue("Surviving ASVs to abundance filter kept by prevalence: {length(otus_to_keep)}/{length(otus_to_loose_by_prevalence)+length(otus_to_keep)}"))
+  
+  # print(glue("Final: {length(otus_to_keep)}/{starting.otus.count} ASVs have passed the abundance+prevalence filter."))
+  return(data %>% filter(OTU %in% otus_to_keep))
+}
+
+calculate_props <- function(data, variables_of_interest, target_level, threshold, abundance_col){
+  # Convert to data.table
+  data <- data.table(data)
+  
+  # Group by OTU, target_level, Type and Site
+  grouped_df <- data %>%
+    dplyr::rename("abundance" = abundance_col) %>%
+    dplyr::group_by(across(all_of(c("OTU", target_level, variables_of_interest)))) %>%
+    dplyr::summarise(mean_abundance = mean(abundance)) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(relative_abundance = mean_abundance/sum(mean_abundance))
+  
+  # Check
+  check_rel_abund_sum(grouped_df, group_cols=c(variables_of_interest), rel_abund_col="relative_abundance")
+  
+  # Reorder by abundance
+  grouped_df <- grouped_df[order(grouped_df[,'relative_abundance'], decreasing=TRUE),]
+  
+  # Merge rows under a certain abundance threshold to "other"
+  under_thresh_df <- grouped_df[grouped_df$relative_abundance < threshold,]
+  over_thresh_df <- grouped_df[grouped_df$relative_abundance >= threshold,]
+  
+  # FIXME: error here if using timeline
+  under_thresh_df <- data.frame(t(c('__OTHER__', '__Other__', variables_of_interest, sum(under_thresh_df$mean_abundance), sum(under_thresh_df$relative_abundance)))) 
+  names(under_thresh_df) <- c('OTU', target_level, variables_of_interest, "mean_abundance", 'relative_abundance')
+  under_thresh_df$relative_abundance <- as.numeric(under_thresh_df$relative_abundance)
+  
+  final_df <- rbind(over_thresh_df, under_thresh_df)
+  final_df$relative_abundance <- as.numeric(final_df$relative_abundance)
+  
+  # Select columns (return value cannot include grouping variables in group_modify)
+  return(data.frame(final_df)[,c("OTU", target_level, 'relative_abundance')])
+}
+
+physeq_proccessing <- function(physeq_obj, target_level, elements_to_target, filter_abundance_threshold, 
+         prevalence_threshold, plot_abundance_threshold, metadata, variables_of_interest, biosample_col){
+  # - Debug -
+  # physeq_obj = phyloseq::rarefy_even_depth(physeq, sample.size=10000)
+  # target_level = "Genus"
+  # elements_to_target = c("Domain","Phylum", "Class", "Order", "Family")
+  # filter_abundance_threshold = 0.0001
+  # prevalence_threshold = 0.6
+  # plot_abundance_threshold = 0.0001
+  # metadata = metadata
+  # biosample_col = "biosample_name"
+  # variables_of_interest = c("water_type","community")
+  
+  # Check
+  if (plot_abundance_threshold<filter_abundance_threshold){
+    stop("Plot abundance threshold can not be lower than the abundance threshold. It could lead to bad interpretation of the results. Stopping...")
+  }
+
+  # Melt physeq
+  # print(glue("Melting phyloseq object to long format..."))
+  data_phylo_long <- physeq_obj %>%
+    tax_glom(taxrank = target_level, bad_empty = c()) %>%   # Aglomerate to taxnomic range
+    psmelt()                                                # Melt into long format
+  
+  # ---- Process biosamples and their reps ----
+  # Abundance + prevalence in replicates of each biosample
+  biosample_data <- data_phylo_long %>%  
+    dplyr::rename("biosample" = biosample_col) %>%
+    dplyr::group_by(biosample) %>% 
+    dplyr::mutate(sample.id.count = n_distinct(sample.id)) %>%
+    dplyr::group_modify(~get.otus.to.keep.by.prevalence(unique(.x$sample.id), .x, filter_abundance_threshold, prevalence_threshold, "sample.id", "Abundance")) %>%
+    dplyr::ungroup() 
+  
+  # Mean abundance in biosample (across replicates)
+  biosample_data <- biosample_data %>%
+    dplyr::group_by(across(all_of(c("OTU", "biosample", variables_of_interest, elements_to_target, target_level, "sample.id.count")))) %>%
+    dplyr::summarise(biosample_mean_abundance = mean(Abundance)) 
+  
+  # Replace .*__ with an emtpy string in target column
+  biosample_data[[target_level]] <- gsub(".*__", '', biosample_data[[target_level]])
+  
+  
+  # ---- Grouping biosamples ----
+  # Abundance + prevalence
+  group_prevalence <- biosample_data %>%  
+    dplyr::group_by(across(all_of(variables_of_interest))) %>%
+    dplyr::group_modify(~get.otus.to.keep.by.prevalence(unique(.x$biosample), .x, filter_abundance_threshold, prevalence_threshold, "biosample", "biosample_mean_abundance")) %>%
+    dplyr::ungroup() 
+  
+  # Calculate group relative abundance
+  # print(glue("Calculate relative abundance by group..."))
+  proportions_per_group <- group_prevalence %>%  
+    dplyr::group_by(across(all_of(variables_of_interest))) %>%
+    dplyr::group_modify(~calculate_props(.x, variables_of_interest, target_level, plot_abundance_threshold, "biosample_mean_abundance"), .keep=TRUE)
+  
+  # Remove empty ASVs
+  proportions_per_group <- subset(proportions_per_group, relative_abundance != 0)
+  
+  # Ensure sum of relative abundances is 1 in each group
+  check_rel_abund_sum(proportions_per_group, group_cols=variables_of_interest, rel_abund_col="relative_abundance")
+  
+  # ---- Reform the phyloseq object (using biosamples) ----
+  # ASVs
+  new_otu_df <- biosample_data[,c("OTU", "biosample", "biosample_mean_abundance")] %>% 
+    dplyr::mutate(across(c("biosample_mean_abundance"), round)) %>%
+    tidyr::pivot_wider(names_from = biosample, values_from = biosample_mean_abundance, values_fill = 0)
+  new_otu_df <- as.data.frame(new_otu_df)
+  rownames(new_otu_df) <- new_otu_df[,"OTU"]
+  new_otu_df[,"OTU"] <- NULL
+  new_otu_df <- as.matrix(new_otu_df)
+  
+  # Taxmat
+  new_taxmat <- biosample_data[,c("OTU", elements_to_target, target_level)] %>% dplyr::distinct(across(c("OTU", elements_to_target, target_level)), .keep_all = TRUE)
+  new_taxmat <- as.data.frame(new_taxmat)
+  rownames(new_taxmat) <- new_taxmat[,"OTU"]
+  new_taxmat[,"OTU"] <- NULL
+  new_taxmat <- as.matrix(new_taxmat)
+  
+  # Metadata
+  new_metadata <- biosample_data[,c("biosample", variables_of_interest)] %>% dplyr::distinct(biosample, .keep_all = TRUE)
+  new_metadata <- as.data.frame(new_metadata)
+  rownames(new_metadata) <- new_metadata[,"biosample"]
+  
+  # Form biosample physeq object
+  biosample_physeq = phyloseq(
+    otu_table(new_otu_df, taxa_are_rows = TRUE), 
+    tax_table(new_taxmat), 
+    sample_data(new_metadata),
+    phy_tree(physeq_obj)
+  )
+
+  return(list(
+    proportions_per_group=proportions_per_group, 
+    biosample_data=biosample_data,
+    biosample_physeq=biosample_physeq
+  ))
+}
+
+get_barplots <- function(
+  proportions, 
+  target_level, 
+  x="label", y="relative_abundance", 
+  form="relative", title="", 
+  column_order=NULL, fwrap_formula=NULL, 
+  modify_legend = FALSE
+  ){
+  
+  # Colors
+  color <- grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)] # Creando vector de colores contrastantes
+  phylum_colors <- distinctColorPalette(length(levels(as.factor(proportions[[target_level]]))))
+  
+  # Change color of __Other__ to black
+  others_pos <- levels(as.factor(proportions[[target_level]])) == "__Other__"
+  phylum_colors[others_pos] <- "black"
+  
+  # Split names by '_'
+  proportions[[target_level]] <- gsub("_", ' ', proportions[[target_level]])
+  
+  # Config plot
+  geom_bar_pos <- NULL
+  ylab <- NULL
+  if (form=="relative"){
+    geom_bar_pos <- "fill"
+    ylab <- "Relative Abundance (RA) %"
+  } else if (form=="as_is"){
+    geom_bar_pos <- "stack"
+    ylab <- "Abundance"
+  } else {
+    stop("Value for variable form not recognized (has to be 'relative' or 'as_is'")
+  }
+  
+  # Main
+  p <- ggplot(proportions, aes_string(x = x, y = y, fill = target_level)) + 
+    geom_bar(stat = "identity", position = geom_bar_pos) + scale_fill_manual(values = phylum_colors)
+  
+  # If facet_wrap
+  if (!is.null(fwrap_formula)){
+    p <- p + facet_wrap(as.formula(fwrap_formula), scales="free_x")
+  }
+
+  # If relative put percentages in values
+  if (form=="relative"){
+    p <- p + scale_y_continuous(labels = scales::percent_format())
+  }
+  
+  # If column_order order columns
+  if (!is.null(column_order)){
+    p <- p + scale_x_discrete(limits = column_order)
+  }
+  
+  # Some formatting
+  p <- p +
+    ylab(ylab) + ggtitle(title) + xlab("") + theme_bw() + 
+    theme(axis.title.x = element_blank(), plot.title = element_text(hjust = 0.5)) + 
+    theme(axis.text.x=element_text(angle = 90, hjust=0.95, vjust=0.2), legend.key.size = unit(0.5,"line"))
+  
+  # This removes legend from ggplotly if active but is still there in ggplot
+  if (modify_legend){
+    p <- p + guides(fill=guide_legend(ncol=1, title=target_level)) # + theme(legend.position="none")
+  }
+  
+  return(p)
+  
+}
+
+```
+
+
+Here we call the declared functions on different combinations of prevalence, minimum relative abundance and taxonomic ranges:
+
+```{r}
+filter_abundance_threshold <- 0.0001
+prevalence_threshold <- 0.3
+plot_abundance_threshold <- 0.0001
+
+# Get proportions
+conf = list(
+  list("Genus", c("Domain","Phylum", "Class", "Order", "Family")),
+  list("Species", c("Domain","Phylum", "Class", "Order", "Family", "Genus")),
+  list("Family", c("Domain","Phylum", "Class", "Order"))
+)
+
+result_list <- list()
+for (i in conf){
+  target_level <- i[[1]]
+  elements_to_target <- i[[2]]
+  out_folder = glue("{output_folder}/barplots/abund-{filter_abundance_threshold}__prev-{prevalence_threshold}__plot-{plot_abundance_threshold}/{target_level}")
+  dir.create(out_folder, showWarnings = FALSE, recursive = TRUE)
+  prop <- NULL
+  
+  # cat("\n")
+  # print(glue("====== {target_level} level ======"))
+  
+  # Get proportions
+  prop <- physeq_proccessing(
+    physeq_obj = rar_physeq, 
+    target_level = target_level,
+    elements_to_target = elements_to_target,
+    filter_abundance_threshold = filter_abundance_threshold, 
+    prevalence_threshold = prevalence_threshold,
+    plot_abundance_threshold = plot_abundance_threshold, 
+    metadata = metadata, 
+    variables_of_interest = variables_of_interest, 
+    biosample_col = biosample_col
+  )
+  
+  proportions_per_group <- prop$proportions_per_group
+  biosample_data <- prop$biosample_data
+
+  # ---- Grouped barplot ----
+  # Prepare labels
+  proportions_per_group$label <- do.call(paste, c(proportions_per_group[variables_of_interest], sep="__"))
+  article_labels <- list(
+    c("saliva__non-crc", "S (non-CRC)"),
+    c("saliva__crc", "S (CRC)"),
+    c("subgingival-fluid__crc", "GCF (CRC)"),
+    c("adenocarcinoma__crc", "Ac (CRC)"),
+    c("normal-mucosa__crc", "NM (CRC)"),
+    c("faeces__crc", "F (CRC)"),
+    c("faeces__non-crc", "F (non-CRC)")
+  )
+  column_order <- c()
+  for (i in article_labels){
+    data_label <- i[[1]]
+    article_label <- i[[2]]
+    proportions_per_group$label <- gsub(data_label, article_label, proportions_per_group$label)
+    column_order <- c(column_order, article_label)
+  }
+  
+  # Plot
+  barplot <- get_barplots(
+    proportions=proportions_per_group,
+    target_level=target_level,
+    x="label",
+    y="relative_abundance",
+    form="relative",
+    title=glue("{target_level} (Abundance:{filter_abundance_threshold}, Prevalence:{prevalence_threshold}, Plot:{plot_abundance_threshold})"),
+    column_order=column_order,
+  )
+  static_barplot <- barplot + 
+    scale_y_continuous(labels = scales::percent_format(), expand = c(0,0)) + 
+    guides(fill=guide_legend(ncol=1, title=target_level)) +
+    ggtitle("") +
+    theme(
+          axis.text.x=element_text(angle = 50, hjust=0.95, vjust=0.95, size=10),
+          axis.text.y=element_text(size=10), 
+          axis.title.y=element_text(size=10),
+          legend.text=element_text(size=8),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          axis.ticks.x=element_blank()
+          # axis.line = element_line(colour = "black")
+          ) 
+
+  # Save plot and tables
+  ggsave(glue("{out_folder}/grouped_barplot.png"), plot=static_barplot, dpi="retina", units="px", width=2000, height=2500)
+
+  for (i in unique(proportions_per_group$label)){
+    temp <- subset(proportions_per_group, label==i)
+    temp$relative_abundance <- temp$relative_abundance*100
+    write.table(temp, gsub(" ", "_", glue("{out_folder}/proportions__{i}.tsv")), sep="\t", row.names=FALSE)
+  }
+
+  htmlwidgets::saveWidget(
+    as_widget(ggplotly(barplot)),
+    glue("{out_folder}/groups_barplot.html")
+  )
+
+  # Store data in list
+  result_list[[target_level]] <- list(
+    proportions_per_group=proportions_per_group, 
+    biosample_data=biosample_data, 
+    biosample_physeq=prop$biosample_physeq,
+    barplot=barplot
+  )
+}
+```
+
+Show plots for each level:
+```{r fig.width=10}
+ggplotly(result_list$Family$barplot)
+ggplotly(result_list$Genus$barplot)
+ggplotly(result_list$Species$barplot)
+```
+
+
+## Percentage of faeces with each oral genus per sample type
+
+The following section counts the presence/absence of oral genera in faeces samples from both CRC and non-CRC patients.
+
+```{r}
+selected_genus <- c("Actinomyces", "Aggregatibacter", "Alloprevotella", 
+                    "Campylobacter", "Capnocytophaga", "Catonella", 
+                    "Desulfobulbus", "Dialister", "Filifactor", 
+                    "Fusobacterium", "Mogibacterium", "Parvimonas", 
+                    "Peptococcus", "Peptostreptococcus", 
+                    "Porphyromonas", "Prevotella", "Prevotella_7", "Prevotella_9",
+                    "Pseudoramibacter", "Streptococcus", 
+                    "Tannerella", "Treponema", "Veillonella"
+)
+# Filter to faeces and count number of biosamples in each sample.type
+df <- subset(result_list$Genus$biosample_data, origin=="faeces")
+sample_count <- list(
+  "crc"=length(unique(subset(df, sample.type=="crc")$biosample)),
+  "noncrc"=length(unique(subset(df, sample.type=="non-crc")$biosample))
+)
+# For each genus count the proportion of samples which have it in each category
+pct_df <- data.frame()
+for (g in selected_genus){
+  crc_count <- length(subset(df, Genus==g & sample.type=="crc" & biosample_mean_abundance>0)$biosample)
+  noncrc_count <- length(subset(df, Genus==g & sample.type=="non-crc" & biosample_mean_abundance>0)$biosample)
+  pct_df <- rbind(pct_df, 
+                data.frame(genus=g, 
+                           crc_count=glue("{crc_count}/{sample_count$crc}"),
+                           noncrc_count=glue("{noncrc_count}/{sample_count$noncrc}"),
+                           crc_pct=round(100*crc_count/sample_count$crc, 2),
+                           noncrc_pct=round(100*noncrc_count/sample_count$noncrc, 2)
+                           )
+                )
+}
+# write.table(pct_df, glue("{output_folder}/prop_of_faeces_with_oral_genus.tsv"), sep="\t", row.names=FALSE)
+create.table(pct_df, "Proportion of faeces with each oral genus.")
+```
+
+## Venn diagram for faeces, subgingival-fluid and adenocarcinoma in CRC
+
+A venn diagram of genera in faeces, subgingival-fluid and adenocarcinoma samples of CRC patients is creted here, mainly in order to see which organisms from the subigingival-fluid are shared with the other two kinds of samples.
+
+```{r}
+# Get data
+df <- result_list$Genus$proportions_per_group
+df <- subset(df, sample.type=="crc")
+l <- list(
+  "Ac"=unique(subset(df, origin=="adenocarcinoma")$Genus),
+  "GCF"=unique(subset(df, origin=="subgingival-fluid")$Genus),
+  "Feces"=unique(subset(df, origin=="faeces")$Genus)
+)
+
+# Plot
+venn_p <- ggvenn(l, c("Ac","GCF", "Feces")) + 
+  ggtitle("Genus Venn Diagram in CRC patients") + 
+  theme(
+    plot.title = element_text(hjust = 0.5, size=15)
+  )
+# ggsave(glue("{output_folder}/crc_venn.png"), dpi="retina", units="px")
+venn_p
+```
+
+**Common in all three origins:**
+```{r}
+intersect(intersect(l$Ac, l$GCF), l$Feces) # shared in ac, gcf and feces
+```
+
+**Only shared between adenocarcinoma and subgingival-fluid:**
+```{r}
+setdiff(intersect(l$Ac, l$GCF), l$Feces) # only between ac and gcf
+```
+
+**Only shared between adenocarcinoma and faeces:**
+```{r}
+setdiff(intersect(l$Ac, l$Feces), l$GCF) # only between ac and feces
+```
+
+**Only shared between subgingival-fluid and faeces:**
+```{r}
+setdiff(intersect(l$GCF, l$Feces), l$Ac) # only between gcf and feces
+```
+
+**Only in adenocarcinoma:**
+```{r}
+setdiff(l$Ac, c(l$GCF, l$Feces)) # only in ac
+```
+
+**Only in subgingival-fluid:**
+```{r}
+setdiff(l$GCF, c(l$Ac, l$Feces)) # only in gcf
+```
+
+**Only in faeces:**
+```{r}
+setdiff(l$Feces, c(l$GCF, l$Ac)) # only in feces
+```
+
+## Alluvial plot for oral genera across samples
+
+In order to see the relative abundance of oral genera across sample types an alluvial plot is created:
+```{r}
+# Get data
+df <- result_list$Genus$proportions_per_group
+
+# Subset commonly oral genus
+selected_genus <- c("Actinomyces", "Aggregatibacter", "Alloprevotella", 
+                    "Campylobacter", "Capnocytophaga", "Catonella", 
+                    "Desulfobulbus", "Dialister", "Filifactor", 
+                    "Fusobacterium", "Mogibacterium", "Parvimonas", 
+                    "Peptococcus", "Peptostreptococcus", 
+                    "Porphyromonas", "Prevotella", "Prevotella_7", "Prevotella_9",
+                    "Pseudoramibacter", "Streptococcus", 
+                    "Tannerella", "Treponema", "Veillonella"
+)
+oral_proportions <- subset(df, Genus %in% selected_genus)
+
+# For each genus add a dummy entry in each group if it does not exist there, with RA=0
+# That will make the ggalluvial plot be able to connect genus across columns
+for (i in unique(oral_proportions$label)){
+  for (j in selected_genus){
+    temp <- subset(oral_proportions, label==i & Genus==j)
+    if (nrow(temp)==0){
+      oral_proportions <- rbind(oral_proportions, 
+                                data.frame(
+                                  origin="dummy",
+                                  sample.type="dummy",
+                                  OTU="randomid",  
+                                  Genus=j,
+                                  relative_abundance=0, 
+                                  label=i
+                                )
+      )
+    }
+  }
+}
+
+# Colors
+color <- grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)] # Creando vector de colores contrastantes
+phylum_colors <- distinctColorPalette(length(levels(as.factor(oral_proportions[["Genus"]]))))
+column_order <- c("S (non-CRC)", "S (CRC)","GCF (CRC)", "Ac (CRC)", "NM (CRC)", "F (CRC)", "F (non-CRC)")
+
+# Plot
+p <- ggplot(oral_proportions, aes(x=label, y=relative_abundance, fill = Genus)) +
+  geom_flow(aes(alluvium = Genus), alpha= 1, #color="gray40",
+            curve_type = "xspline",
+            width = .5) +
+  geom_col(width = .5) +
+  scale_x_discrete(limits = column_order, expand = c(0,0)) +
+  scale_fill_manual(values = phylum_colors) +
+  scale_y_continuous(labels = scales::percent_format(), expand = c(0,0)) +
+  theme_classic() +
+  ylab("Relative abundance (RA) %") + ggtitle("") + xlab("") + 
+  guides(fill=guide_legend(ncol=1)) +
+  theme(
+    axis.title.x = element_blank(), plot.title = element_text(hjust = 0.5),
+    axis.text.x=element_text(angle = 50, hjust=0.95, vjust=0.95, size=10), legend.key.size = unit(0.5,"line"),
+    axis.text.y=element_text(size=10), 
+    axis.title.y=element_text(size=10),
+    legend.text=element_text(size=8),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank()
+  ) 
+# ggsave(glue("{output_folder}/alluvial_1.png"), dpi="retina", units="px", width=2500, height=2000)
+p
+```
+
+## Checking oral genera per biosample
+
+We can also visually check the rarefied abundance of oral genera that seem to appear in different abundances between CRC and non-CRC faeces, and see a notable difference:
+
+```{r}
+# Select genera
+selected_genus <- c(
+  "Fusobacterium", "Parvimonas", 
+  "Peptostreptococcus", 
+  "Porphyromonas", "Prevotella"
+)
+selected_genus <- c(selected_genus, paste("g__", selected_genus, sep=''))
+
+# Create fake entries for each biosample with an almost 0 mean abundance
+# This is done in order to see all biosamples and not only those that had any of
+# the genera
+df <- subset(result_list$Genus$biosample_data, origin=="faeces")
+df <- rbind(df, 
+            data.frame(OTU="dummy_organism",biosample=df$biosample, origin=df$origin, sample.type=df$sample.type,
+                       Genus="dummy_organism", 
+                       # Species="dummy_organism", 
+                       biosample_mean_abundance=0.0000000000001) %>% dplyr::distinct()
+)
+df <- subset(df, Genus %in% c("dummy_organism", selected_genus))
+df$Genus <- gsub(".*__","",df$Genus)
+# df$species_with_genus <- paste(df$Genus, df$Species, sep=';')
+
+# Plot
+p <- get_barplots(
+  proportions=df,
+  target_level="Genus",
+  x="biosample",
+  y="biosample_mean_abundance",
+  form="as_is",
+  title=glue(""),
+  fwrap_formula = "~sample.type"
+) + theme(axis.text.x=element_blank(),
+          axis.ticks.x=element_blank())
+ggplotly(p)
+
+
+```
+
+
+
+
+# Differential abundance
+
+In order to calculate differential abundance we use ANCOM-BC on the filtered, non-rarefied phyloseq object, comparing faeces samples between crc and non-crc patients.
+
+## Preparation
+Firstly, we declare the main function and load ANCOM-BC:
+```{r}
+library(ANCOMBC)
+run_ancombc_1vs1 <- function(physeq_obj, target_level, target_variables, prv_cut=0.3, qval_min=0.1){
+  # IMPORTANT: ANCOM-BC v2.0.1 was used. Its output format varies depending on version
+  if (target_level=="ASV"){
+    ancom_target <- NULL
+  } else {
+    ancom_target <- target_level
+  }
+  
+  # Run ANCOM-BC
+  out <- ancombc(data=physeq_obj, tax_level=ancom_target, prv_cut=prv_cut, 
+                            formula = paste(target_variables, collapse="+"), n_cl=60,
+                            p_adj_method="holm", alpha = 0.05) 
+  # Get results
+  res = out$res
+  
+  # To long
+  lfc_long <- res$lfc[,c(-2)] %>% tidyr::pivot_longer(cols = starts_with(target_variables), names_to = "var", values_to = "lfc")
+  diff_abn_long <- res$diff_abn[,c(-2)] %>% tidyr::pivot_longer(cols = starts_with(target_variables), names_to = "var", values_to = "diff_abn")
+  se_long <- res$se[,c(-2)] %>% tidyr::pivot_longer(cols = starts_with(target_variables), names_to = "var", values_to = "se")
+  qval_long <- res$q_val[,c(-2)] %>% tidyr::pivot_longer(cols = starts_with(target_variables), names_to = "var", values_to = "qval")
+  
+  # Merge long
+  merged <- Reduce(function(x, y) merge(x, y, by=c("taxon","var")), 
+         list(lfc_long, diff_abn_long, se_long, qval_long))
+  
+  # Get taxons where any of the tests achived a certain qval
+  selected_taxons <- res$q_val[rowSums(res$q_val[,c(-1,-2),drop=F]<=qval_min)!=0,]$taxon
+  merged <- subset(merged, taxon %in% selected_taxons) 
+  merged
+  
+  # Change column name
+  names(merged)[1] <- "taxon_id"
+
+  # Add names if ASV was selected as target_level
+  if (target_level=="ASV"){
+    merged$taxon_id <- data.frame(tax_table(physeq_obj))[merged$taxon_id,][,"Species"]
+  }
+  
+  # Format taxon_id to remove things like "g__"
+  # merged$taxon_id <- gsub(".*__", '', merged$taxon_id)
+  
+  # Format results for plotting
+  df_fig <- merged %>%
+    dplyr::arrange(desc(lfc)) %>%
+    dplyr::mutate(direction = ifelse(lfc > 0, "Positive LFC", "Negative LFC"))
+  df_fig$direction <- factor(df_fig$direction, levels = c("Positive LFC", "Negative LFC"))
+  
+  # Significance label
+  # - Corrected p-value (qval) under 0.001 will have "***"
+  # - Corrected p-value (qval) under 0.01 will have "**"
+  # - Corrected p-value (qval) under 0.05 will have "*"
+  df_fig$qval.txt <- cut(df_fig$qval, c(-Inf,0.001,0.01,0.05,Inf), labels=c('***','**','*','-'))
+  
+  # Orientation for significance level
+  df_fig$orientation <- 0
+  df_fig$orientation[df_fig$lfc > 0] <- 1
+  df_fig$orientation[df_fig$lfc < 0] <- -1  
+  
+  # Add target level
+  df_fig$target_level <- target_level
+  
+  return(df_fig)
+}
+
+# Function to get the proper alpha value for each significance level
+# (non-significant entries will be grayed out)
+get_scale_alpha_values <- function(vec){
+  l <- length(unique(vec))
+  alpha_vec <- rep(1, l)
+  if ("-" %in% vec){
+    alpha_vec[length(alpha_vec)] <- 0.4
+  }
+  return(alpha_vec)
+}
+
+```
+
+Here we process the phyloseq object, selecting only faeces and the target variables (CRC or non-CRC), group by sample.type, origin and subject using the median (in case a patient had multiple faeces samples):
+```{r}
+# Filter phyloseq object
+ps <- subset_samples(physeq, origin %in% c("faeces"))
+
+# # Add previous level to each taxonomic level
+# temp <- as.data.frame(tax_table(ps))
+# temp$Species <- paste(temp[,"Genus"], temp[,"Species"], sep=';')
+# temp$Genus <- paste(temp[,"Family"], temp[,"Genus"], sep=';')
+# temp$Family <- paste(temp[,"Order"], temp[,"Family"], sep=';')
+# temp$Order <- paste(temp[,"Class"], temp[,"Order"], sep=';')
+# temp$Class <- paste(temp[,"Phylum"], temp[,"Class"], sep=';')
+# tax_table(ps) <- tax_table(as.matrix(temp))
+
+# Group by sample.type, origin and subject
+sample_data(ps)$group <- mapply(
+  paste0,
+  as.character(get_variable(ps, "sample.type")),
+  as.character(get_variable(ps, "origin")),
+  as.character(get_variable(ps, "subject")),
+  collapse = "_"
+)
+derep_ps <- phyloseq::merge_samples(ps, "group", fun=median)
+
+# The function merge_samples transforms string factors to numeric
+# so we need to replace the metadata of derep_ps
+# based on: https://github.com/joey711/phyloseq/issues/608
+df <- sample_data(ps) #Extract sample data dataframe 
+rmreps <- subset(df, !duplicated(group)) # Remove rows with duplicate values by the factor "SampleType" (it will retain 1 of each SampleType value -if associated variables are unique it will pick one)
+sorted_rmreps <- rmreps[order(rmreps$group),] #Sort dataframe in order of "SampleType" to match merged phyloseq object
+rownames(sorted_rmreps) <- sorted_rmreps$group #Rename rows of dataframe to match the sample_names in the merged phyloseq object
+sample_data(derep_ps) <- sorted_rmreps # Replace metadata in merged phyloseq object with populated metadata file
+
+# For some reason the merge_samples transposes the otu_table so we turn it back
+otu_table(derep_ps) <- t(otu_table(derep_ps))
+
+derep_ps
+```
+
+## Comparing CRC faeces vs non-CRC faeces
+Run the main function on each taxonomic level with a prevalence cut of 0.3:
+```{r  class.source = 'fold-show'}
+# Run on each level
+proc_phylum_ancombc <- NULL
+proc_class_ancombc <- NULL
+proc_order_ancombc <- NULL
+proc_family_ancombc <- NULL
+proc_genus_ancombc <- NULL
+proc_species_ancombc <- NULL
+proc_asv_ancombc <- NULL
+
+proc_phylum_ancombc <- run_ancombc_1vs1(derep_ps, "Phylum", c("sample.type"), prv_cut=0.3)
+proc_class_ancombc <- run_ancombc_1vs1(derep_ps, "Class", c("sample.type"), prv_cut=0.3)
+proc_order_ancombc <- run_ancombc_1vs1(derep_ps, "Order", c("sample.type"), prv_cut=0.3)
+proc_family_ancombc <- run_ancombc_1vs1(derep_ps, "Family", c("sample.type"), prv_cut=0.3)
+proc_genus_ancombc <- run_ancombc_1vs1(derep_ps, "Genus", c("sample.type"), prv_cut=0.3)
+proc_species_ancombc <- run_ancombc_1vs1(derep_ps, "Species", c("sample.type"), prv_cut=0.3)
+proc_asv_ancombc <- run_ancombc_1vs1(derep_ps, "ASV", c("sample.type"), prv_cut=0.3)
+
+# Concatenate results
+df_fig <- rbind(proc_phylum_ancombc, proc_class_ancombc, proc_order_ancombc, 
+                proc_family_ancombc, proc_genus_ancombc, proc_species_ancombc, 
+                proc_asv_ancombc
+)
+df_fig$target_level <- factor(df_fig$target_level,      # Reordering group factor levels
+                               levels = c("Phylum","Class","Order","Family","Genus","Species","ASV")
+                              )
+create.table(df_fig)
+```
+
+Remove entries that are unclassified bacteria or incertae sedis and plot the results, which show an increased abundance of Parvimonas, Fusobacterium and Bacteroides fragilis in CRC faeces:
+```{r fig.height=10}
+# Remove untrusted organisms
+df_fig <- df_fig[!grepl("Incertae|uncultured", df_fig$taxon_id),]
+
+# Plot
+p <- NULL
+p <- ggplot(data = subset(df_fig), aes(x = taxon_id, y = lfc, fill=direction, alpha=qval.txt)) + 
+  scale_alpha_manual(values=get_scale_alpha_values(df_fig$qval.txt)) +
+  geom_bar(stat = "identity",
+           position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lfc - se, ymax = lfc + se), width=0.5,
+                position = position_dodge2(width = 0.9, preserve = "single"), 
+                color = "gray36") + 
+  geom_text(aes(label = qval.txt, y=lfc+orientation*(se+0.22)), vjust = 0.7, color = "gray36",
+            position = position_dodge2(width = 0.9, preserve = "single")) +
+  # geom_vline(xintercept = (1:length(df_fig$taxon_id)-1)+0.5, alpha=0.5, linetype="dotted") +
+  geom_hline(yintercept = 0, alpha=0.5) +
+  facet_wrap(~target_level, scale="free_y", ncol=1) +
+  labs(x = NULL, y = "Log fold change", title = "") + 
+  # scale_fill_discrete(name = NULL) +
+  # scale_color_discrete(name = NULL) +
+  # scale_x_discrete(limits = unique(df_fig$taxon_id)) +
+  coord_flip() +
+  theme_bw() + 
+  theme(
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    axis.text.y=element_text(size=10), 
+    axis.title.y=element_text(size=10, face = "italic"),
+    legend.text=element_text(size=8)
+    # panel.grid.major = element_blank(),
+    # panel.grid.minor = element_blank(),
+    # panel.border = element_blank(),
+    # panel.background = element_blank(),
+    # axis.ticks.x=element_blank()
+    # axis.line = element_line(colour = "black")
+  )
+p
+# ggsave(glue("{output_folder}/ancombc.png"),
+#        dpi="retina", unit="px", height=4000, width=4000)
+```
+
+## Comparing faeces based on CRC/non-CRC + sex
+
+In this section we check if sex is influencing the abundance of Parvimonas or Fusobacterium with a prevalence cut of 0.3. The plot shows the comparison of CRC females against the rest of groups (CRC males, non-CRC males and non-CRC females). It can be seen that Parvimonas and Fusobacterium are both reduced significantly in non-CRC females, reduced in non-CRC males and do not change for CRC males.
+
+```{r}
+# Create a column combining target variables only
+# This will be the one used in the test
+sample_data(derep_ps)$var <- mapply(
+  paste0,
+  as.character(get_variable(derep_ps, "sample.type")),
+  as.character(get_variable(derep_ps, "sex")),
+  collapse = "_"
+)
+
+# Run
+proc_genus_ancombc <- NULL
+proc_genus_ancombc <- run_ancombc_1vs1(derep_ps, "Genus", c("var"), prv_cut=0.3)
+
+# Concatenate results
+df_fig <- rbind(proc_genus_ancombc)
+df_fig$target_level <- factor(df_fig$target_level,      # Reordering group factor levels
+                              levels = c("Genus")
+)
+create.table(df_fig, "ANCOM-BC results.")
+
+# Plot
+p <- NULL
+p <- ggplot(data = subset(df_fig), aes(x = taxon_id, y = lfc, fill=var, alpha=qval.txt)) + 
+  scale_alpha_manual(values=get_scale_alpha_values(df_fig$qval.txt)) +
+  geom_bar(stat = "identity",
+           position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lfc - se, ymax = lfc + se), width=1,
+                position = position_dodge2(width = 0.9, preserve = "single"), 
+                color = "gray36") + 
+  geom_text(aes(label = qval.txt, y=lfc+orientation*(se+0.22)), vjust = 0.7, color = "gray36",
+            position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_vline(xintercept = (1:length(df_fig$taxon_id)-1)+0.5, alpha=0.5, linetype="dotted") +
+  geom_hline(yintercept = 0, alpha=0.5) +
+  # facet_wrap(~target_level, scale="free_y", ncol=1) +
+  labs(x = NULL, y = "Log fold change", title = "") + 
+  # scale_fill_discrete(name = NULL) +
+  # scale_color_discrete(name = NULL) +
+  scale_x_discrete(limits = unique(df_fig$taxon_id)) +
+  coord_flip() +
+  theme_bw() + 
+  theme(
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    axis.text.y=element_text(size=10), 
+    axis.title.y=element_text(size=10, face = "italic"),
+    legend.text=element_text(size=8),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.ticks.x=element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+p
+```
+
+## Comparing faeces focusing on oral genera
+
+The following plot centers around typically oral genera and how they change between CRC faeces and non-CRC faeces. Additionally, combinations of Fusobacterium, Parvimonas, Peptrostreptococcus, Porphyromonas and Prevotella are created, merging the ASVs under each genus into one ASV, in order to see if the agglomerated oral genera could increase the significance of the differential abundance test. The reasoning is that maybe having any of these organisms could be associated with an increased risk of CRC. Dialister was not included in these combinations, as it seemed to increment the standard error of the LFC, resulting in non-significant changes between groups.
+
+**Important notes:**
+
+* All the **combinations including Parvimonas Or Fusobacterium have been removed except the one where every genus is used**, because anything added on top of Parvimonas or Fusobacterium results in significant change, as their changes were already significant between groups.
+* The **prevalence cut has been removed** in order to show every oral organism (it was 0.3 in the previous examples). This results in Peptostreptococcus being significantly changed between groups, but it does not happen when the prevalence cut is above 0.1.
+
+Firstly, we create a new phyloseq object with the aforementioned combinations:
+```{r}
+# ---- Specify oral genera ----
+oral_genus <- c("Actinomyces", "Aggregatibacter", "Alloprevotella",
+                "Campylobacter", "Capnocytophaga", "Catonella",
+                "Desulfobulbus", "Dialister", "Filifactor",
+                "Fusobacterium", "Mogibacterium", "Parvimonas",
+                "Peptococcus", "Peptostreptococcus",
+                "Porphyromonas", "Prevotella", "Prevotella_7",
+                "Pseudoramibacter", "Tannerella", "Treponema", "Veillonella"
+)
+
+# ---- Merge oral genera into one ASV ----
+ps <- derep_ps # calculated in a previous chunck
+selected_genus <- unique(c(
+  "Porphyromonas", "Prevotella", "Peptostreptococcus",
+  "Fusobacterium", "Parvimonas"
+))
+
+merged_asv_count_rows <- data.frame()
+merged_asv_tax_rows <- data.frame()
+for (n in 2:length(selected_genus)){
+  # Get possible combinations of length n
+  combs <- combinations(n = length(selected_genus), r = n, repeats.allowed = F, v = selected_genus) # combination matrix
+  combs <- lapply(seq_len(nrow(combs)), function(x) combs[x,]) # to list of vectors
+  
+  # For each combination merge ASVs of those genera into one
+  for (v in combs){
+    name <- paste(v, collapse='_')
+
+    # Merge
+    oral_asv_table <- otu_table(subset_taxa(ps, Genus %in% c(v, paste("g__", v, sep=''))))
+    temp <- data.frame(colSums(oral_asv_table))
+    names(temp) <- c(name)
+    oral_asv_counts_row <- as.matrix(t(temp))
+    oral_asv_tax_row <- as.matrix(data.frame(Domain=name, Phylum=name,
+                                             Class=name, Order=name, Family=name,
+                                             Genus=name, Species=name))
+    rownames(oral_asv_tax_row) <- c(name)
+    
+    # Store
+    merged_asv_count_rows <- rbind(merged_asv_count_rows, oral_asv_counts_row)
+    merged_asv_tax_rows <- rbind(merged_asv_tax_rows, oral_asv_tax_row)
+  }
+}
+merged_asv_count_rows <- as.matrix(merged_asv_count_rows)
+merged_asv_tax_rows <- as.matrix(merged_asv_tax_rows)
+
+# Recreate phyloseq object, adding the rows created
+new.clean.otu.df <- rbind(otu_table(ps)[,colnames(merged_asv_count_rows)], merged_asv_count_rows)
+new.taxmat <- rbind(tax_table(ps), merged_asv_tax_rows)
+
+OTU = otu_table(new.clean.otu.df, taxa_are_rows = TRUE)
+TAX = tax_table(new.taxmat)
+SAM = sample_data(sample_data(ps))
+
+new.physeq = phyloseq(OTU, TAX, SAM)
+new.physeq
+```
+
+Now we run ANCOM-BC, with no prevalence cut (as mentioned before):
+```{r fig.height=8}
+# Run on each level
+proc_genus_ancombc <- NULL
+proc_genus_ancombc <- run_ancombc_1vs1(new.physeq, "Genus", c("sample.type"), prv_cut=0, qval_min=1)
+
+# Concatenate results
+df_fig <- proc_genus_ancombc
+df_fig <- df_fig %>% dplyr::arrange(lfc)
+
+# Remove g__
+df_fig$taxon_id <- gsub(".*__","",df_fig$taxon_id)
+
+# Filter to the ones that were combinated or oral genus
+df_fig <- subset(df_fig, taxon_id %in% c(rownames(merged_asv_tax_rows), oral_genus) & target_level=="Genus")
+
+# Grab longest combination (which will contain all + Fuso + Parvi)
+taxon_underscore_count <- unlist(lapply(df_fig$taxon_id, function(x){str_count(x,"_")}))
+longest_combination <- df_fig[taxon_underscore_count==max(taxon_underscore_count),]$taxon_id
+
+# Subset
+df_fig$has.fuso.or.parvi <- ifelse(grepl("Fusobacterium_|_Fusobacterium|_Parvimonas|Parvimonas_", df_fig$taxon_id), "Has Fusobacterium or Parvimonas", "Does not have Fusobacterium or Parvimonas")
+df_fig <- df_fig[grepl(paste(oral_genus, collapse="|"), df_fig$taxon_id),]
+df_fig <- subset(df_fig, has.fuso.or.parvi=="Does not have Fusobacterium or Parvimonas" | taxon_id == longest_combination)
+
+# Show table
+create.table(df_fig, "ANCOM-BC results.")
+
+# Plot
+p <- NULL
+p <- ggplot(data = subset(df_fig), aes(x = taxon_id, y = lfc, fill=direction, alpha=qval.txt)) + 
+  scale_alpha_manual(values=get_scale_alpha_values(df_fig$qval.txt)) +
+  geom_bar(stat = "identity",
+           position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lfc - se, ymax = lfc + se), width=.5,
+                position = position_dodge2(width = 0.9, preserve = "single"), 
+                color = "gray36") + 
+  geom_text(aes(label = qval.txt, y=lfc+orientation*(se+0.1)), vjust = 0.7, color = "gray36",
+            position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_hline(yintercept = 0, alpha=0.5) +
+  facet_wrap(~target_level, scale="free_y", ncol=1) +
+  labs(x = NULL, y = "Log fold change", title = "") + 
+  scale_x_discrete(limits = unique(df_fig$taxon_id)) +
+  coord_flip() +
+  theme_bw() + 
+  theme(
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    axis.text.y=element_text(size=10),
+    axis.title.y=element_text(size=10, face = "italic"),
+    legend.text=element_text(size=8)
+  )
+p
+```
+
+
+# Session info
+
+Session info, including used packages, is available here:
+
+```{r}
+sessionInfo()
+```
+
+
