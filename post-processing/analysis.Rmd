@@ -63,6 +63,8 @@ library(phyloseq)
 library(ggalluvial)
 library(stringr)
 library(gtools)
+library(microbiome)
+library(ggh4x)
 
 # Note: ANCOM-BC is loaded in its own section, this is because it loads tidytree and 
 # creates an unavoidable warning/message each time a function in the the phyloseq package is used,
@@ -104,6 +106,7 @@ BASE_DIR = "/home/usuario/Proyectos/CRC-16S-study"
 feature_table_file <- as.character(glue("{BASE_DIR}/data/feature-table.json"))
 contamination_file <- as.character(glue("{BASE_DIR}/data/contaminants.tsv"))
 metadata_file <- as.character(glue("{BASE_DIR}/data/non-ffpe_metadata.tsv"))
+odontological_md_file <- as.character(glue("{BASE_DIR}/data/odontological_metadata.tsv"))
 taxmat_file <- as.character(glue("{BASE_DIR}/data/separated_taxonomy.tsv"))
 tree_file <- as.character(glue("{BASE_DIR}/data/tree.nwk"))
 output_folder <- as.character(glue("{BASE_DIR}/output"))
@@ -1400,6 +1403,289 @@ ggplotly(p)
 
 ```
 
+# Subgingival Microbial Dysbiosis Index (SMDI) 
+
+The simplified Subgingival Microbial Dysbiosis Index (SMDI), based on 5 genera, is calculated here as described in https://doi.org/10.1177/0022034521103577. The one based on species is not used due to the limitations of the V3V4 region (some ASV will not be able to be classified at species level). Note: for most subjects there is no subgingival-fluid sample available, and the ones that are present are only from CRC patients.
+
+```{r}
+# Extracted from paper:
+# 'The read counts were then normalized by CLR transformation with the “transform” 
+# function in R package “microbiome”'
+
+# 'For each list of DS or DG (i.e., at the different MDG cutoffs), SMDI was calculated 
+# for individual samples in the training set as follows: 
+# SMDI = (mean CLR abundance of dysbiotic DS/DG) – (mean CLR abundance of normobiotic DS/DG)'
+
+# Target level
+target_level <- "Genus"
+dysbiotic_taxa <- c("Fretibacterium", "Treponema", "Mogibacterium")
+normobiotic_taxa <- c("Actinomyces", "Streptococcus")
+
+# Normalize
+ps = tax_glom(physeq, target_level)
+clr_ps <- microbiome::transform(ps, transform="clr")
+
+# Convert to long
+clr_ps_long <- clr_ps %>%
+  tax_glom(taxrank = target_level, bad_empty = c()) %>%   # Aglomerate to taxnomic range
+  psmelt()        
+
+clr_ps_long[[target_level]] <- gsub(".*__", '', clr_ps_long[[target_level]])
+clr_ps_long[[target_level]] <- gsub("_", ' ', clr_ps_long[[target_level]])
+
+# Get score for each sample
+temp <- subset(clr_ps_long, origin=="subgingival-fluid")[c("sample.id","subject","origin","sample.type",target_level,"Abundance")]
+l <- list()
+for (sample in sort(unique(temp$sample.id))){
+  # Subset
+  data <- subset(temp, sample.id==sample)
+  
+  # Filter
+  df_dysbiotic <- data[data[[target_level]] %in% dysbiotic_taxa,]
+  df_normobiotic <- data[data[[target_level]] %in% normobiotic_taxa,]
+  
+  # Check all specified taxa are there
+  if ((nrow(df_dysbiotic)==0) | (!all(df_dysbiotic[[target_level]] %in% dysbiotic_taxa))){
+    stop("Error")
+  }
+  if ((nrow(df_normobiotic)==0) | (!all(df_normobiotic[[target_level]] %in% normobiotic_taxa))){
+    stop("Error")
+  }
+  
+  # Get SMDI
+  l[sample] = mean(df_dysbiotic$Abundance) - mean(df_normobiotic$Abundance)
+}
+
+smdi.scores <- stack(l)[2:1]
+names(smdi.scores) <- c("biosample_name","smdi")
+smdi.scores[which(smdi.scores["smdi"] >= -2), "smdi_indicates"] <- "Periodontal disease (SMDI)"
+smdi.scores[which(smdi.scores["smdi"] < -2), "smdi_indicates"] <- "No periodontal disease (SMDI)"
+create.table(smdi.scores)
+```
+
+Now the SMDI is merged with the extra odontological metadata:
+
+```{r}
+# Read odontological metadata and merge with SMDI
+odontological_metadata <- read.delim(odontological_md_file)
+odontological_metadata <- merge(x = odontological_metadata, y = smdi.scores, by="biosample_name", all = TRUE)
+
+# Add simplified stage (IIIA -> III)
+odontological_metadata <- odontological_metadata %>% mutate(simplified_periodontal_stage = case_when(
+  periodontal_disease_stage == "no_periodontal_disease" ~ "No periodontal\ndisease",
+  periodontal_disease_stage == "no_teeth" ~ "No teeth",
+  TRUE ~ str_sub(periodontal_disease_stage, 0, -2),
+  )
+) 
+odontological_metadata$simplified_periodontal_stage <- factor(odontological_metadata$simplified_periodontal_stage, levels=c("No periodontal\ndisease", "I", "II", "III", "IV", "No teeth"))
+
+create.table(odontological_metadata)
+```
+
+Plot SMDI according to stage:
+```{r}
+ggplot(odontological_metadata, aes(x=simplified_periodontal_stage, y=smdi, fill=simplified_periodontal_stage)) + 
+  geom_hline(yintercept=-2, linetype="dashed", color = "darkgray") +
+  geom_boxplot(alpha=0.5) + 
+  geom_dotplot(binaxis='y', stackdir='center', dotsize=.3, fill="white") +
+  theme_classic() +
+  xlab("Periodontal Disease Stage") +
+  ylab("SMDI") +
+  guides(fill=guide_legend(title="Periodontal disease stage")) +
+  theme(
+    axis.text=element_text(size=10, color="black"), 
+    axis.title=element_text(size=10, face="bold"),
+    legend.text=element_text(size=10)
+  )
+ggsave(glue("{output_folder}/smdi_vs_disease.png"), dpi=600, width=5000, height=3500, units="px")
+```
+
+Check if differences between stages' SMDI are significant:
+
+```{r}
+temp <- subset(odontological_metadata, simplified_periodontal_stage %in% c("I", "II", "III", "IV"))
+
+model <- lm(smdi ~ simplified_periodontal_stage, data = temp)
+model.av <- aov(model)
+tukey.test <- TukeyHSD(model.av)
+
+res <- data.frame(round(tukey.test$simplified_periodontal_stage,4))
+res[res$p.adj < 0.05, "significant"] <- TRUE
+create.table(res)
+```
+
+
+# Normalized abundance plots (CLR)
+
+In the following plots CLR abundance is used to show differences in some taxa according to multiple variables.
+```{r}
+# Normalize
+ps = tax_glom(physeq, "Species")
+clr_ps <- microbiome::transform(ps, transform="clr")
+
+# Merge
+temp <- merge(
+  data.frame(sample_data(clr_ps)),
+  odontological_metadata %>% select(-biosample_name),
+  by="subject",
+  all.x=TRUE
+)
+row.names(temp) <- temp$sample.id
+sample_data(clr_ps) <- temp
+
+# Agglomerate and turn into long
+clr_ps_long <- clr_ps %>%
+  tax_glom(taxrank = "Species", bad_empty = c()) %>%   # Aglomerate to taxnomic range
+  psmelt()   
+
+# Plots
+temp <- subset(
+  clr_ps_long, 
+  Species %in% c("g__Parvimonas_NA", "g__Fusobacterium_NA", "g__Peptostreptococcus_NA", "s__Bacteroides_fragilis")
+)
+temp[["Species"]] <- gsub(".*__", '', temp[["Species"]])
+temp[["Species"]] <- gsub("_", ' ', temp[["Species"]])
+temp[["Species"]] <- gsub(" NA", ' sp.', temp[["Species"]])
+temp[is.na(temp["smdi_indicates"]), "smdi_indicates"] <- "No data"
+levels(temp$simplified_periodontal_stage) <- c(levels(temp$simplified_periodontal_stage), "No data")
+temp[is.na(temp["simplified_periodontal_stage"]), "simplified_periodontal_stage"] <- "No data"
+
+
+plot_boxes <- function(data, x, y, title=NULL){
+  ggplot(data, aes_string(x=x, y=y, fill="Species")) + 
+  facet_wrap(~Species, scales="free") +
+  geom_boxplot(alpha=0.5) + 
+  # geom_dotplot(binaxis='y', stackdir='center', dotsize=.3, fill="white") +
+  theme_classic() +
+  xlab(NULL) +
+  ylab("Abundance (CLR)") +
+  ggtitle(title) +
+  guides(fill=guide_legend(title="Taxa")) +
+  theme(
+    axis.text=element_text(size=10, color="black"), 
+    axis.title=element_text(size=10, face="bold"),
+    axis.title.y=element_text(size=10, face="bold", margin = margin(t = 0, r = 20, b = 0, l = 0)),
+    legend.text=element_text(size=10),
+    axis.text.x=element_text(angle = 45, hjust=0.95, vjust=0.95, size=10),
+    plot.title = element_text(size = 15, color = 'black', face="bold"),
+    strip.background =element_rect(fill="white", color="white"),
+    strip.text = element_text(colour = 'black', face="bold.italic")
+  )
+}
+
+p <- plot_boxes(subset(temp, origin == "faeces"), "sample.type", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC vs. Healthy feces")
+labels <- list(
+    c("crc", "F (CRC)"),
+    c("non-crc", "F (non-CRC)")
+)
+p <- p + scale_x_discrete(
+    limits = unlist(lapply(labels, function(x){x[[1]]})), 
+    labels = unlist(lapply(labels, function(x){x[[2]]}))
+)
+ggsave(glue("{output_folder}/clr_feces.png"), p, dpi=400, width=3000, units="px")
+p
+
+p <- plot_boxes(subset(temp), "grouping_var", "Abundance", "Normalized CLR Abundance of different taxa \nin all types of samples")
+labels <- list(
+    c("saliva__non-crc", "S (non-CRC)"),
+    c("saliva__crc", "S (CRC)"),
+    c("subgingival-fluid__crc", "GCF (CRC)"),
+    c("adenocarcinoma__crc", "Ac (CRC)"),
+    c("normal-mucosa__crc", "NM (CRC)"),
+    c("faeces__crc", "F (CRC)"),
+    c("faeces__non-crc", "F (non-CRC)")
+)
+p <- p + scale_x_discrete(
+    limits = unlist(lapply(labels, function(x){x[[1]]})), 
+    labels = unlist(lapply(labels, function(x){x[[2]]}))
+  )
+ggsave(glue("{output_folder}/clr_everything.png"), p, dpi=400, width=3500, height=3000, units="px") 
+p
+
+p <- plot_boxes(subset(temp, sample.type=="crc" & origin == "faeces"), "smdi_indicates", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC feces according to SMDI classification")
+ggsave(glue("{output_folder}/clr_smdi_feces.png"), p, dpi=400, width=3500, height=3000, units="px")
+p
+
+p <- plot_boxes(subset(temp, sample.type=="crc" & origin == "faeces"), "simplified_periodontal_stage", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC feces according to periodontal disease stages")
+ggsave(glue("{output_folder}/clr_periodontalstage_feces.png"), p, dpi=400, width=3500, units="px")
+p
+
+p <- plot_boxes(subset(temp, sample.type=="crc" & origin == "faeces"), "age_group", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC feces according to age group")
+ggsave(glue("{output_folder}/clr_age_feces.png"), p, dpi=400, width=3500, units="px")
+p
+
+p <- plot_boxes(subset(temp, sample.type=="crc" & origin == "faeces" & simplified_location != "nd"), "simplified_location", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC feces according to tumor location")
+ggsave(glue("{output_folder}/clr_location_feces.png"), p, dpi=400, width=3500, units="px")
+p
+
+p <- plot_boxes(subset(temp, sample.type=="crc" & origin == "faeces" & simplified_location != "nd"), "tnm_t", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC feces according to tumor size")
+ggsave(glue("{output_folder}/clr_tumorsize_feces.png"), p, dpi=400, width=3500, units="px")
+p
+
+p <- plot_boxes(subset(temp, sample.type=="crc" & origin == "faeces" & simplified_location != "nd"), "tnm_n", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC feces according to lymph node affection")
+ggsave(glue("{output_folder}/clr_lymphnode_feces.png"), p, dpi=400, width=3500, units="px")
+p
+
+p <- plot_boxes(subset(temp, sample.type=="crc" & origin == "faeces" & simplified_location != "nd"), "tnm_m", "Abundance", "Normalized CLR Abundance of different taxa \nin CRC feces according to metastatis presence")
+ggsave(glue("{output_folder}/clr_metastasis_feces.png"), p, dpi=400, width=3500, units="px")
+p
+
+
+
+
+
+p <- ggplot(temp, aes(x=age, y=Abundance, color=grouping_var)) +
+  facet_grid(origin~Species, scales="free") +
+  geom_point(alpha=0.5) +
+  # geom_dotplot(binaxis='y', stackdir='center', dotsize=.3, fill="white") +
+  theme_bw() +
+  # xlab(NULL) +
+  ylab("Abundance (CLR)") +
+  # guides(fill=guide_legend(title="Legend title")) +
+  ggtitle("Normalized CLR Abundance of different taxa according to age") +
+  theme(
+    axis.text=element_text(size=10, color="black"), 
+    axis.title=element_text(size=10, face="bold"),
+    axis.title.y=element_text(size=10, face="bold", margin = margin(t = 0, r = 20, b = 0, l = 0)),
+    legend.text=element_text(size=10),
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    plot.title = element_text(size = 15, color = 'black', face="bold"),
+    strip.background =element_rect(fill="white", color="white"),
+    strip.text = element_text(colour = 'black', face="bold.italic")
+  )
+ggsave(glue("{output_folder}/clr_agevsfeces_points.png"), p, dpi=400, width=4000, units="px")
+p
+
+
+p <- ggplot(temp, aes(x=smdi, y=Abundance, color=grouping_var)) +
+  facet_grid(origin~Species, scales="free") +
+  geom_point(alpha=0.5) +
+  # geom_dotplot(binaxis='y', stackdir='center', dotsize=.3, fill="white") +
+  theme_bw() +
+  # xlab(NULL) +
+  ylab("Abundance (CLR)") +
+  # guides(fill=guide_legend(title="Legend title")) +
+  ggtitle("Normalized CLR Abundance of different taxa according to SMDI") +
+  theme(
+    axis.text=element_text(size=10, color="black"), 
+    axis.title=element_text(size=10, face="bold"),
+    axis.title.y=element_text(size=10, face="bold", margin = margin(t = 0, r = 20, b = 0, l = 0)),
+    legend.text=element_text(size=10),
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    plot.title = element_text(size = 15, color = 'black', face="bold"),
+    strip.background =element_rect(fill="white", color="white"),
+    strip.text = element_text(colour = 'black', face="bold.italic")
+  )
+ggsave(glue("{output_folder}/clr_smdivsfeces_points.png"), p, dpi=400, width=4000, units="px")
+p
+
+
+
+
+
+```
+
+
 
 
 
@@ -1781,6 +2067,280 @@ p <- ggplot(data = subset(df_fig), aes(x = taxon_id, y = lfc, fill=direction, al
     legend.text=element_text(size=8)
   )
 p
+```
+
+
+## Using datasets from other papers to corroborate results
+
+In order to see how generalizable the results are, the same procedure was conducted on three published datasets using their original reads (including the QIIME pipeline), which belonged to feces from CRC patients and healthy subjects using 16S rRNA V4:
+
+- Baxter et al. 2016: 
+  - USA
+  - 16s rRNA V4
+  - 186 normal stools, 224 adenoma stools, 127 carcinoma stools
+- Zeller et al. 2014: 
+  - France
+  - 16s rRNA V4
+  - 50 normal stools, 38 adenoma stools, 41 carcinoma stools
+- Zackular et al. 2014: 
+  - USA and Canada
+  - 16s rRNA V4
+  - 30 normal stools, 30 adenoma stools, 30 carcinoma stools
+
+First create a phyloseq object for each dataset
+```{r}
+dataset_names <- c("baxter", "zackular", "zeller")
+dataset.physeqs <- list()
+for (dataset_name in dataset_names){
+  # Expected files
+  feature_table_file <- as.character(glue("{BASE_DIR}/data/extra_datasets/{dataset_name}/feature-table.json"))
+  contamination_file <- as.character(glue("{BASE_DIR}/data/contaminants.tsv"))
+  metadata_file <- as.character(glue("{BASE_DIR}/data/extra_datasets/{dataset_name}/metadata.tsv"))
+  taxmat_file <- as.character(glue("{BASE_DIR}/data/extra_datasets/{dataset_name}/separated_taxonomy.tsv"))
+
+  ######################
+  # ---- Features ---- #
+  ######################
+  # Transform biome data to JSON.biome
+  # biom convert -i in.biom -o out.biom.json --table-type="OTU table" --to-json
+  
+  # Read
+  otu_df <- import_biom(feature_table_file)
+  
+  # Remove columns/samples with all 0s (no data)
+  condition <- colSums(otu_df) != 0
+  otu_df_empty_cols <- colnames(otu_df)[!condition]
+  if (length(otu_df_empty_cols)>0){
+    print(glue("WARNING: There are {length(otu_df_empty_cols)} empty columns in ASV dataframe (no data, this can happen in controls) and they will be removed: '{paste(otu_df_empty_cols, collapse='; ')}'"))
+  }
+  otu_df <- otu_df[, condition]
+  
+  ######################
+  # ---- Metadata ---- #
+  ######################
+  # Read metadata
+  metadata <- read.delim(metadata_file, sep="\t")
+  
+  # Check if there are columns not in otu_df besides the otu_df columns that were empty
+  condition <- metadata[,'sample.id'] %in% colnames(otu_df)
+  sample.ids.not.in.otus <- metadata[!condition,]$sample.id
+  if (length(setdiff(otu_df_empty_cols, sample.ids.not.in.otus))>0){
+    warning("There are samples in metadata that do not exist in ASV dataframe. This can happen if they were removed in the previous step.")
+    print(setdiff(otu_df_empty_cols, sample.ids.not.in.otus))
+  }
+  metadata <- metadata[condition,] # eliminar muestras si no existen en otu_df
+  rownames(metadata) <- metadata[,'sample.id']
+  
+  ######################
+  # ---- Taxonomy ---- #
+  ######################
+  # Taxonomy must be split into columns
+  taxmat <- read.delim(taxmat_file, sep='\t')
+  rownames(taxmat) <- taxmat$feature_id
+  taxmat$feature_id <- NULL
+  
+  # Propagate NAs
+  keep_unidentified <- function(tx_table){
+    # Keep the ones that have one of c(NA, "", " ", "\t") in target_level column
+    # and then find the last level that is known (can be Genus, Family...)
+    # Assign to the target_level level the last known level + x__XXX NA
+    # Family (last known)   Species
+    # f__Lachnospiraceae    f__Lachnospiraceae NA
+    elements_to_target <- colnames(tx_table)
+    tx_table <- as.data.frame(tx_table)
+    previous_level <- elements_to_target[1]
+    for (level in elements_to_target[2:length(elements_to_target)]){
+      empty_values <- tx_table[[level]] %in% c(NA, "", " ", "\t")
+      tx_table[[level]][empty_values] <- paste(tx_table[[previous_level]][empty_values], "NA", sep="_")
+      tx_table[[level]][empty_values] <- gsub("(_NA[> ]*)*", "\\1", tx_table[[level]][empty_values]) # Replace repetitions of NA by one NA
+      
+      previous_level <- level
+    }
+    
+    return(tx_table)
+  }
+  taxmat <- as.matrix(keep_unidentified(taxmat))
+
+  dataset.physeq = phyloseq(
+    otu_table(otu_df, taxa_are_rows = TRUE), 
+    tax_table(taxmat), 
+    sample_data(metadata)
+  )
+  dataset.physeqs[[dataset_name]] = dataset.physeq
+}
+
+dataset.physeqs
+```
+
+Check metadata of each dataset:
+
+```{r}
+create.table(sample_data(dataset.physeqs$baxter), "Baxter Metadata")
+create.table(sample_data(dataset.physeqs$zackular), "Zackular Metadata")
+create.table(sample_data(dataset.physeqs$zeller), "Zeller Metadata")
+```
+
+
+Run ANCOM-BC on each dataset:
+```{r}
+# Add our dataset
+dataset_names <- c(dataset_names, "conde")
+dataset.physeqs[["conde"]] <- subset_samples(physeq, origin=="faeces")
+
+
+datasets.res <- list()
+for (dataset_name in dataset_names){
+  ps <- dataset.physeqs[[dataset_name]]
+  if (dataset_name=="baxter"){
+    # Set up main variable
+    sample_data(ps)$var <- sample_data(ps)$dx_bin
+
+  } else if (dataset_name=="zackular") {
+    # Set up main variable
+    sample_data(ps)$var <- sample_data(ps)$sample.type
+
+  } else if (dataset_name=="zeller"){
+    # Set up main variable
+    sample_data(ps)$var <- sample_data(ps)$sample.type
+  } else if (dataset_name=="conde"){
+    # Set up main variable
+    sample_data(ps)$var <- sample_data(ps)$sample.type
+  } 
+  
+  
+  article_labels <- list(
+    c("High Risk Normal", "normal"),
+    c("Large adenoma", "adenoma"),
+    c("Small adenoma", "adenoma"),
+    c("adv Adenoma", "adenoma"),
+    c("Cancer", "cancer"),
+    c("Adenoma", "adenoma"),
+    c("carcinoma", "cancer"),
+    c("Normal", "normal"),
+    c("non-crc", "normal"),
+    c("crc", "cancer")
+  )
+  for (i in article_labels){
+    data_label <- i[[1]]
+    article_label <- i[[2]]
+    sample_data(ps)$var <- gsub(data_label, article_label, sample_data(ps)$var)
+  }
+  sample_data(ps)$var <- factor(sample_data(ps)$var, levels=c("cancer", "adenoma", "normal"))
+
+  # Run on each level
+  proc_phylum_ancombc <- NULL
+  proc_class_ancombc <- NULL
+  proc_order_ancombc <- NULL
+  proc_family_ancombc <- NULL
+  proc_genus_ancombc <- NULL
+  proc_species_ancombc <- NULL
+  proc_asv_ancombc <- NULL
+  prv_cut=0.1
+  
+  proc_genus_ancombc <- tryCatch({run_ancombc_1vs1(ps, "Genus", c("var"), prv_cut=prv_cut)}, 
+    error = function(e) {
+              message(glue("ERROR: {e}"))
+              message("ANCOM-BC failed, returning NULL")
+              NULL
+    }
+  )
+  proc_species_ancombc <- tryCatch({run_ancombc_1vs1(ps, "Species", c("var"), prv_cut=prv_cut)}, 
+    error = function(e) {
+              message(glue("ERROR: {e}"))
+              message("ANCOM-BC failed, returning NULL")
+              NULL
+    }
+  )
+  proc_asv_ancombc <- tryCatch({run_ancombc_1vs1(ps, "ASV", c("var"), prv_cut=prv_cut)}, 
+    error = function(e) {
+              message(glue("ERROR: {e}"))
+              message("ANCOM-BC failed, returning NULL")
+              NULL
+    }
+  )
+  
+  # Concatenate results
+  df_fig <- rbind(proc_phylum_ancombc, proc_class_ancombc, proc_order_ancombc, 
+                  proc_family_ancombc, proc_genus_ancombc, proc_species_ancombc, 
+                  proc_asv_ancombc
+  )
+  df_fig$target_level <- factor(df_fig$target_level,      # Reordering group factor levels
+                                 levels = c("Phylum","Class","Order","Family","Genus","Species","ASV")
+                                )
+  
+  df_fig$dataset_name <- dataset_name
+  datasets.res[[dataset_name]] <- data.frame(df_fig)
+}
+
+```
+
+```{r fig.height=10, fig.width=18}
+concat_results <- bind_rows(datasets.res)
+
+df_fig = subset(concat_results, var=="varnormal")# target_level=="Genus" # )
+
+# Rename studies
+article_labels <- list(
+  c("zeller", "Zeller et al. 2014"),
+  c("conde", "This study"),
+  c("baxter", "Baxter et al. 2016"),
+  c("zackular", "Zackular et al. 2014")
+)
+for (i in article_labels){
+  data_label <- i[[1]]
+  article_label <- i[[2]]
+  df_fig$dataset_name <- gsub(data_label, article_label, df_fig$dataset_name)
+}
+df_fig$dataset_name <- factor(df_fig$dataset_name, levels=c("This study", "Zeller et al. 2014", "Baxter et al. 2016", "Zackular et al. 2014"))
+df_fig$taxon_id <- gsub(".__", "", df_fig$taxon_id)
+df_fig$taxon_id <- gsub("_", " ", df_fig$taxon_id)
+
+# Remove untrusted organisms
+df_fig <- df_fig[!grepl("Incertae|uncultured|unidentified|metagenome", df_fig$taxon_id),]
+
+# Add custom color label
+df_fig[df_fig$direction=="Positive LFC", "Direction"] <- "More in normal subjects"
+df_fig[df_fig$direction=="Negative LFC", "Direction"] <- "More in CRC subjects"
+
+# Plot
+p <- NULL
+p <- ggplot(data = subset(df_fig), aes(x = taxon_id, y = lfc, fill=Direction, alpha=qval.txt)) + 
+  scale_alpha_manual(values=get_scale_alpha_values(df_fig$qval.txt)) +
+  geom_bar(stat = "identity",
+           position = position_dodge2(width = 0.9, preserve = "single")) +
+  geom_errorbar(aes(ymin = lfc - se, ymax = lfc + se), width=0.5,
+                position = position_dodge2(width = 0.9, preserve = "single"), 
+                color = "gray36") + 
+  geom_text(aes(label = qval.txt, y=lfc+orientation*(se+0.3)), vjust = 0.7, color = "gray36",
+            position = position_dodge2(width = 0.9, preserve = "single")) +
+  # geom_vline(xintercept = (1:length(df_fig$taxon_id)-1)+0.5, alpha=0.5, linetype="dotted") +
+  geom_hline(yintercept = 0, alpha=0.5) +
+  facet_grid2(dataset_name~target_level, scales = "free_y", independent = "y", space = "free_y") +
+  labs(x = NULL, y = "Log fold change", title = glue("")) + 
+  # scale_fill_discrete(name = NULL) +
+  scale_fill_manual(values=c("#ff6640", "#40b9ff")) +
+  # scale_color_discrete(name = NULL) +
+  # scale_x_discrete(limits = unique(df_fig$taxon_id)) +
+  coord_flip() +
+  theme_bw() + 
+  theme(
+    axis.text.x=element_text(angle = 0, hjust=0.95, vjust=0.95, size=10),
+    axis.text.y=element_text(size=10, face = "italic", color="black"), 
+    axis.title.x=element_text(size=12, face="bold", margin = margin(t = 10, r = 0, b = 0, l = 0)),
+    legend.text=element_text(size=12),
+    legend.title=element_text(size=12),
+    plot.title = element_text(size = 15, color = 'black', face="bold"),
+    strip.background =element_rect(fill="white"),
+    strip.text = element_text(size = 12, colour = 'black', face="bold.italic"),
+    # panel.grid.major = element_blank(),
+    # panel.grid.minor = element_blank(),
+    # panel.border = element_blank(),
+    # panel.background = element_blank(),
+    # axis.ticks.x=element_blank()
+    # axis.line = element_line(colour = "black")
+  )
+p
+ggsave(glue("{output_folder}/ancom-bc_datasets.png"), p, dpi=600, height=5500, width=12000, units="px")
 ```
 
 

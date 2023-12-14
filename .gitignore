@@ -1,9 +1,11 @@
 *.html
 output/
-data/feature-table.json
-data/separated_taxonomy.tsv
-data/taxonomy.tsv
-data/tree.nwk
+*feature-table.json
+*feature-table.txt
+*separated_taxonomy.tsv
+*taxonomy.tsv
+*tree.nwk
+data/patients.tsv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

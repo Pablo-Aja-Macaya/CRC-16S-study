@@ -1,6 +1,6 @@
 This repository contains the explanations/code to reproduce the bioinformatic analyses done in [**Undisclosed Study**]().
 
-The main output is available with its code, output and explanation in HTML at [**`post-processing/analysis_CRC__2023-03-24.zip`**](post-processing/analysis_CRC__2023-03-24.zip)
+The main output is available with its code, output and explanation in HTML at [**`post-processing/analysis_CRC__2023-12-01.zip`**](post-processing/analysis_CRC__2023-12-01.zip)
 
 ## Index
 - [Requirements](#requirements)
@@ -158,7 +158,7 @@ When it is done multiple outputs will be available, which will be the ones used 
 
 ## Post processing
 
-A script has been developed to format and clean data, apply negative controls and to study alpha-diversity, beta-diversity, relative abundance and differential abundance. This script is available as a Rmarkdown file at `post-processing/analysis.Rmd`, with its code, output and explanation in HTML at [**`post-processing/analysis_CRC__2023-03-24.zip`**](post-processing/analysis_CRC__2023-03-24.zip). In order to run the script the `microbiome_r_env` environment must be active.
+A script has been developed to format and clean data, apply negative controls and to study alpha-diversity, beta-diversity, relative abundance and differential abundance. This script is available as a Rmarkdown file at `post-processing/analysis.Rmd`, with its code, output and explanation in HTML at [**`post-processing/analysis_CRC__2023-12-01.zip`**](post-processing/analysis_CRC__2023-12-01.zip). In order to run the script the `microbiome_r_env` environment must be active.
 
 <p align="center">
   <img src="post-processing/examples.png">
