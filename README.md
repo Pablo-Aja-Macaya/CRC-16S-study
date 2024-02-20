@@ -1,6 +1,6 @@
 This repository contains the explanations/code to reproduce the bioinformatic analyses done in [**The multispecies microbial cluster of Fusobacterium, Parvimonas, Bacteroides and Faecalibacterium as a precision biomarker for colorectal cancer diagnosis**](https://doi.org/10.1002/1878-0261.13604).
 
-The main output is available with its code, output and explanation in HTML at [**`post-processing/analysis_CRC__2023-12-01.zip`**](post-processing/analysis_CRC__2023-12-01.zip)
+**Main output** with code, output and explanation in HTML at [**`post-processing/analysis_CRC__2023-12-01.zip`**](post-processing/analysis_CRC__2023-12-01.zip)
 
 ## Index
 - [Requirements](#requirements)
